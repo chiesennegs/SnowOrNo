@@ -16,6 +16,7 @@ import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.widget.EditText;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
@@ -31,18 +32,24 @@ import org.json.JSONException;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 public final class MainActivity extends Activity {
+    private static final int CALENDAR_TAB = 2;
+    private record CalendarOrigin(int tab, int scrollY) {}
+
     private int bg, panel, line, ink, muted, mint, deep, warn;
     private boolean lightMode, settingsOpen, feedbackOpen;
     private String dailyStormId;
@@ -87,6 +94,8 @@ public final class MainActivity extends Activity {
     private Future<?> activeRequest;
     private int request, tab;
     private int calendarDay;
+    private CalendarOrigin calendarOrigin;
+    private final Set<Instant> expandedStorms = new HashSet<>();
     private int insetTop, insetBottom;
 
     @Override
@@ -189,6 +198,7 @@ public final class MainActivity extends Activity {
         if (settingsOpen) closeSettings();
         else if (dailyStormId != null) closeDailySnowfall();
         else if (feedbackOpen) closeFeedback();
+        else if (tab == CALENDAR_TAB && calendarOrigin != null) returnFromCalendar();
         else super.onBackPressed();
     }
 
@@ -282,6 +292,8 @@ public final class MainActivity extends Activity {
         putSelectedSite(getPreferences(MODE_PRIVATE).edit()).apply();
         setForecast(null);
         calendarDay = 0;
+        expandedStorms.clear();
+        if (calendarOrigin != null) calendarOrigin = new CalendarOrigin(calendarOrigin.tab(), 0);
         loadForecast();
     }
 
@@ -402,6 +414,7 @@ public final class MainActivity extends Activity {
         add(place, placeRow, 0);
         add(place, label(String.format(Locale.US, "%.4f°, %.4f°  ·  Point forecast", site.latitude(),
                 site.longitude()), 13, muted, false), 10);
+        if (forecast != null) addLocationTemperatures(place);
         LinearLayout savedLocations = row();
         Forecast.Site saved = favorites.find(site);
         TextView save = action(saved == null ? "☆ Save favorite" : "★ Saved", saved != null, () -> {
@@ -427,32 +440,30 @@ public final class MainActivity extends Activity {
             int index = i;
             LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1);
             if (i > 0) params.leftMargin = dp(7);
-            tabs.addView(action(names[i], tab == i, () -> {
-                tab = index;
-                render();
-            }), params);
+            tabs.addView(action(names[i], tab == i, () -> selectTab(index)), params);
         }
         add(root, tabs, 14);
         body = column();
         add(root, body, 15);
+        if (tab == CALENDAR_TAB) renderCalendarShortcuts();
 
         if (forecast == null) {
             LinearLayout status = card();
             add(status, label(loading ? "Loading ensemble forecasts" : "Live forecast unavailable", 21, ink, true), 0);
             add(status, label(loading ? "Requesting NOAA, ECMWF, and Canadian guidance."
                     : "No recent forecast is saved for this location. Check your connection and tap the refresh icon.", 14, muted, false), 8);
-            add(body, status, 0);
+            add(body, status, tab == CALENDAR_TAB ? 10 : 0);
             add(body, action("Storm history", false, this::openFeedback), 12);
             return;
         }
 
         String sourceStatus = showingCache ? (loading ? "CACHED FORECAST · REFRESHING" : "CACHED FORECAST · LIVE UPDATE UNAVAILABLE")
                 : "LIVE MODEL GUIDANCE";
-        add(body, label(sourceStatus, 12, showingCache ? warn : mint, true), 0);
+        add(body, label(sourceStatus, 12, showingCache ? warn : mint, true), tab == CALENDAR_TAB ? 10 : 0);
         add(body, label("Retrieved " + RETRIEVED.format(retrievedAt.atZone(ZoneId.systemDefault())), 12, muted, false), 3);
         if (tab == 0) renderLocation();
         if (tab == 1) renderStorm();
-        if (tab == 2) renderCalendar();
+        if (tab == CALENDAR_TAB) renderCalendar();
 
         TextView notes = action("Forecast methods & sources", false, this::showMethods);
         add(body, notes, 18);
@@ -495,9 +506,15 @@ public final class MainActivity extends Activity {
         for (int day = 0; day < result.days().length; day++) {
             PropertySnow.Day point = result.days()[day];
             LinearLayout entry = row();
-            entry.addView(label(dates(day, day + 1), 14, ink, true), new LinearLayout.LayoutParams(0, -2, 1));
+            int targetDay = day;
+            String date = dates(day, day + 1);
+            TextView openDate = action(date, false, () -> openCalendar(targetDay));
+            openDate.setTextColor(mint);
+            openDate.setContentDescription("Open " + date + " in Calendar");
+            entry.addView(openDate);
+            entry.addView(new View(this), new LinearLayout.LayoutParams(0, 0, 1));
             entry.addView(label(point == null ? "Unavailable" : propertyDepth(point.remaining()), 14, muted, false));
-            add(timeline, entry, 11);
+            add(timeline, entry, 6);
         }
         add(body, timeline, 11);
         add(body, action("Storm history", false, this::openFeedback), 12);
@@ -506,6 +523,30 @@ public final class MainActivity extends Activity {
             render();
         }), 12);
         if (showMeltDetails) renderSnowpack();
+    }
+
+    private void addLocationTemperatures(LinearLayout place) {
+        OffsetDateTime now = Instant.now().atOffset(forecast.offset);
+        int today = (int)ChronoUnit.DAYS.between(forecast.start, now.toLocalDate());
+        int hour = today * 24 + now.getHour();
+        double current = hour >= 0 && hour < Forecast.DAYS * 24
+                ? forecast.conditions(hour, hour + 1).low() : Double.NaN;
+        String reading = Double.isFinite(current)
+                ? units.temperatures(current, current) + " (model estimate)" : "Unavailable";
+        add(place, label("Current temperature  ·  " + reading, 14, mint, true), 8);
+        addDailyTemperature(place, "Today", today);
+        addDailyTemperature(place, "Tomorrow", today + 1);
+    }
+
+    private void addDailyTemperature(LinearLayout section, String period, int day) {
+        String range = "Unavailable";
+        if (day >= 0 && day < Forecast.DAYS) {
+            Forecast.Conditions conditions = forecast.conditions(day * 24, (day + 1) * 24);
+            if (Double.isFinite(conditions.low()) && Double.isFinite(conditions.high())) {
+                range = units.temperatures(conditions.low(), conditions.high());
+            }
+        }
+        add(section, label(period + " low / high  ·  " + range, 14, ink, false), 7);
     }
 
     private String propertyDepth(PropertySnow.Depth depth) {
@@ -553,9 +594,6 @@ public final class MainActivity extends Activity {
 
         for (SnowTimeline.Event event : timeline.events) {
             LinearLayout storm = card();
-            Runnable openDay = () -> openStormDay(event);
-            storm.setOnClickListener(view -> openDay.run());
-            storm.setFocusable(true);
             boolean extended = event.extended();
             add(storm, label(extended ? "Extended storm signal" : "Storm window", 20, mint, true), 0);
             int first = event.first(), end = event.end();
@@ -579,10 +617,14 @@ public final class MainActivity extends Activity {
                 }
                 LinearLayout breakdown = column();
                 addHistogram(breakdown, stats.buckets());
-                breakdown.setVisibility(View.GONE);
-                TextView show = action("Show snowfall distribution", false, () -> {});
+                Instant eventStart = forecast.start.atStartOfDay().plusHours(event.first()).toInstant(forecast.offset);
+                boolean expanded = expandedStorms.contains(eventStart);
+                breakdown.setVisibility(expanded ? View.VISIBLE : View.GONE);
+                TextView show = action(expanded ? "Hide snowfall distribution" : "Show snowfall distribution", false, () -> {});
                 show.setOnClickListener(view -> {
                     boolean open = breakdown.getVisibility() == View.VISIBLE;
+                    if (open) expandedStorms.remove(eventStart);
+                    else expandedStorms.add(eventStart);
                     breakdown.setVisibility(open ? View.GONE : View.VISIBLE);
                     show.setText(open ? "Show snowfall distribution" : "Hide snowfall distribution");
                 });
@@ -590,7 +632,7 @@ public final class MainActivity extends Activity {
                 add(storm, breakdown, 0);
                 addStormFeedback(storm, event, stats);
             }
-            add(storm, action("Open first day in Calendar", false, openDay), 9);
+            add(storm, action("Open first day in Calendar", false, () -> openCalendar(event.first() / 24)), 9);
             add(body, storm, 12);
         }
     }
@@ -875,11 +917,44 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void openStormDay(SnowTimeline.Event event) {
-        tab = 2;
-        calendarDay = event.first() / 24;
-        render();
-        scroller.scrollTo(0, 0);
+    private void selectTab(int index) {
+        if (index == tab) return;
+        if (index == CALENDAR_TAB) {
+            openCalendar(calendarDay);
+        } else if (calendarOrigin != null && index == calendarOrigin.tab()) {
+            returnFromCalendar();
+        } else {
+            calendarOrigin = null;
+            tab = index;
+            renderAtScroll(0);
+        }
+    }
+
+    private void openCalendar(int day) {
+        calendarOrigin = new CalendarOrigin(tab, scroller.getScrollY());
+        tab = CALENDAR_TAB;
+        calendarDay = day;
+        renderAtScroll(0);
+    }
+
+    private void returnFromCalendar() {
+        CalendarOrigin origin = calendarOrigin;
+        calendarOrigin = null;
+        tab = origin.tab();
+        renderAtScroll(origin.scrollY());
+    }
+
+    private void renderCalendarShortcuts() {
+        LinearLayout shortcuts = row();
+        if (calendarOrigin != null) shortcuts.addView(action("‹ Back", false, this::returnFromCalendar));
+        if (forecast != null) {
+            int today = (int)ChronoUnit.DAYS.between(forecast.start, LocalDate.now(forecast.offset));
+            if (today >= 0 && today < Forecast.DAYS) {
+                shortcuts.addView(new View(this), new LinearLayout.LayoutParams(0, 0, 1));
+                shortcuts.addView(action("Today", false, () -> selectDay(today)));
+            }
+        }
+        add(body, shortcuts, 0);
     }
 
     private void addWeather(LinearLayout section, Forecast.Conditions conditions) {
@@ -1042,10 +1117,20 @@ public final class MainActivity extends Activity {
     }
 
     private void selectDay(int day) {
-        int position = scroller.getScrollY();
         calendarDay = day;
+        renderAtScroll(scroller.getScrollY());
+    }
+
+    private void renderAtScroll(int position) {
         render();
-        scroller.post(() -> scroller.scrollTo(0, position));
+        // The new content must be measured before ScrollView can restore a deep offset.
+        scroller.getViewTreeObserver().addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override public boolean onPreDraw() {
+                scroller.getViewTreeObserver().removeOnPreDrawListener(this);
+                scroller.scrollTo(0, position);
+                return true;
+            }
+        });
     }
 
     private String eventTime(int hour) {
