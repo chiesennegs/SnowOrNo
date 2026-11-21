@@ -9,6 +9,7 @@ import java.util.function.ToDoubleFunction;
 
 final class Forecast {
     static final int DAYS = 30;
+    static final int STORM_LOOKBACK_DAYS = 3;
     static final double[] BINS = {0.1, 2, 4, 8, 12};
     static final String[] BIN_LABELS = {"Under 0.1 in", "0.1–<2 in", "2–<4 in", "4–<8 in", "8–<12 in", "12 in or more"};
 
@@ -18,14 +19,38 @@ final class Forecast {
             this(celsius, snowCm, rainMm, cloud, sunWatts, Double.NaN);
         }
     }
-    record Member(Hour[][] days) {}
+    record Member(Hour[][] days, double[] earlierSnowCm) {
+        Member(Hour[][] days) { this(days, new double[0]); }
+
+        double snowfallAt(int hour) {
+            if (hour < 0) {
+                int index = earlierSnowCm.length + hour;
+                return index < 0 ? Double.NaN : earlierSnowCm[index];
+            }
+            Hour[] day = days[hour / 24];
+            Hour sample = day == null ? null : day[hour % 24];
+            return sample == null ? Double.NaN : sample.snowCm();
+        }
+    }
     record Model(String name, List<Member> members) {}
     record Conditions(double low, double high, double wind, double peakWind) {}
+    record Confidence(String rating, String reason) {}
+    static final Confidence EXTENDED_CONFIDENCE = new Confidence("Very low",
+            "This window includes extended guidance from day 15 onward. Snowfall amounts and timing are especially uncertain at this lead time.");
     private record ConditionsSample(Conditions conditions, double weight) {}
-    record Sample(double snow, double rain, double low, double high, double cloud,
+    enum Weather {
+        SUNNY("Sunny"), PARTLY_SUNNY("Partly sunny"), PARTLY_CLOUDY("Partly cloudy"), CLOUDY("Cloudy"),
+        RAIN("Rain"), MIXED("Rain and snow"), SNOW("Snow"), ICE("Icing possible");
+
+        final String label;
+
+        Weather(String label) { this.label = label; }
+    }
+
+    record Sample(double snow, double rain, double freezingRain, double low, double high, double cloud,
                   double freshTemp, double melt, double remaining, boolean refreeze, double wind, double peakWind, double weight) {
         Sample withWeight(double value) {
-            return new Sample(snow, rain, low, high, cloud, freshTemp, melt, remaining, refreeze, wind, peakWind, value);
+            return new Sample(snow, rain, freezingRain, low, high, cloud, freshTemp, melt, remaining, refreeze, wind, peakWind, value);
         }
     }
 
@@ -115,7 +140,7 @@ final class Forecast {
     }
 
     private static Sample accumulate(Member member, int first, int end) {
-        double snow = 0, rain = 0, cloud = 0, lows = 0, highs = 0;
+        double snow = 0, rain = 0, freezingRain = 0, cloud = 0, lows = 0, highs = 0;
         double snowTemp = 0, melt = 0, snowpack = 0;
         boolean refrozen = false, thawedSinceSnow = false;
         Wind wind = new Wind();
@@ -131,6 +156,7 @@ final class Forecast {
                 max = Math.max(max, temp);
                 snow += hour.snowCm();
                 rain += hour.rainMm();
+                if (temp <= 0) freezingRain += hour.rainMm();
                 cloud += hour.cloud();
                 snowTemp += hour.snowCm() * temp;
 
@@ -156,7 +182,7 @@ final class Forecast {
             highs += max;
         }
         double freshWater = snow * 10 / 7;
-        return new Sample(snow / 2.54, rain / 25.4, fahrenheit(lows / (end - first)),
+        return new Sample(snow / 2.54, rain / 25.4, freezingRain / 25.4, fahrenheit(lows / (end - first)),
                 fahrenheit(highs / (end - first)), cloud / (24 * (end - first)),
                 snow == 0 ? Double.NaN : fahrenheit(snowTemp / snow),
                 freshWater < 0.36 ? Double.NaN : Math.min(100, 100 * melt / freshWater),
@@ -165,6 +191,19 @@ final class Forecast {
 
     static double fahrenheit(double celsius) {
         return celsius * 9 / 5 + 32;
+    }
+
+    static Confidence snowfallConfidence(int families, boolean extended, boolean beyondWeek,
+                                         boolean diverge, double median, double width) {
+        if (families == 0) return new Confidence("Unavailable", "Too few members have complete snowfall guidance for this window.");
+        if (extended) return EXTENDED_CONFIDENCE;
+        if (beyondWeek) return new Confidence("Low", "The window extends beyond the first seven forecast days, when snowfall guidance is less reliable.");
+        if (families < 2) return new Confidence("Low", "Only one model family has enough complete data for this window.");
+        if (diverge) return new Confidence("Low", "The model families disagree on median snowfall. Their difference exceeds the agreement threshold.");
+        if (width <= Math.max(2, median * .50)) {
+            return new Confidence("Higher", "The window falls within the first seven forecast days, model families agree, and the middle 80% of snowfall estimates is relatively narrow.");
+        }
+        return new Confidence("Moderate", "The model families agree on the median within the first seven forecast days, but individual members suggest a wide range of snowfall amounts.");
     }
 
     static double quantile(List<Sample> samples, ToDoubleFunction<Sample> value, double q) {
@@ -229,22 +268,27 @@ final class Forecast {
             return spread <= tolerance ? "Models aligned" : "Models diverge";
         }
 
-        String confidence() {
-            if (!available()) return "Unavailable";
-            if (first >= 14) return "Very low";
-            if (end > 7 || sources.size() < 2 || agreement().equals("Models diverge")) return "Low";
-            double width = snow(.90) - snow(.10);
-            return width <= Math.max(2, snow(.50) * .50) ? "Higher" : "Moderate";
+        Confidence confidence() {
+            return snowfallConfidence(sources.size(), first >= 14, end > 7, agreement().equals("Models diverge"),
+                    snow(.50), snow(.90) - snow(.10));
         }
 
         String weather() {
-            if (snow(.5) >= .1 && rain(.5) >= .05) return "Rain and snow";
-            if (snow(.5) >= .1) return "Snow";
-            if (rain(.5) >= .05) return "Rain";
+            return weatherIcon().label;
+        }
+
+        Weather weatherIcon() {
+            if (quantile(samples, Sample::freezingRain, .5) >= .02) return Weather.ICE;
+            boolean snowy = snow(.5) >= .1;
+            boolean rainy = rain(.5) >= .05;
+            if (snowy && rainy) return Weather.MIXED;
+            if (snowy) return Weather.SNOW;
+            if (rainy) return Weather.RAIN;
             double cloud = quantile(samples, Sample::cloud, .5);
-            if (cloud >= 70) return "Mostly cloudy";
-            if (cloud >= 35) return "Partly cloudy";
-            return "Mostly clear";
+            if (cloud >= 70) return Weather.CLOUDY;
+            if (cloud >= 45) return Weather.PARTLY_CLOUDY;
+            if (cloud >= 20) return Weather.PARTLY_SUNNY;
+            return Weather.SUNNY;
         }
 
         String surface() {

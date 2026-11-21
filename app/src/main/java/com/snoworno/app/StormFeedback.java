@@ -6,6 +6,7 @@ import org.json.JSONObject;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -15,7 +16,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 
 final class StormFeedback {
@@ -24,12 +27,36 @@ final class StormFeedback {
     private final List<Entry> entries = new ArrayList<>();
 
     record ModelEstimate(String name, double median) {}
+    record ForecastPoint(int hour, double median) {}
+    record Progress(Instant through, double measured, double forecastMedian) {}
     record Snapshot(Instant retrieved, Instant start, Instant end, ZoneOffset offset, double low,
-                    double median, double high, String models, List<ModelEstimate> estimates, boolean complete) {
-        long overlap(Snapshot other) {
-            Instant from = start.isAfter(other.start()) ? start : other.start();
-            Instant until = end.isBefore(other.end()) ? end : other.end();
+                    double median, double high, String models, List<ModelEstimate> estimates, boolean complete,
+                    List<ForecastPoint> curve) {
+        long overlap(Instant first, Instant last) {
+            Instant from = start.isAfter(first) ? start : first;
+            Instant until = end.isBefore(last) ? end : last;
             return Math.max(0, Duration.between(from, until).getSeconds());
+        }
+
+        Snapshot withCurve(SnowTimeline timeline, SnowTimeline.Event event) {
+            List<ForecastPoint> points = new ArrayList<>();
+            for (SnowTimeline.CumulativePoint point : timeline.cumulative(event)) {
+                points.add(new ForecastPoint(point.hour() - event.first(), point.median()));
+            }
+            return new Snapshot(retrieved, start, end, offset, low, median, high, models, estimates, complete, points);
+        }
+
+        double medianThrough(Instant through) {
+            if (!complete || !retrieved.isBefore(start) || through.isBefore(start) || through.isAfter(end)) return Double.NaN;
+            if (through.equals(end)) return median;
+            double hour = Duration.between(start, through).getSeconds() / 3600.0;
+            for (int i = 1; i < curve.size(); i++) {
+                ForecastPoint before = curve.get(i - 1), after = curve.get(i);
+                if (hour < before.hour() || hour > after.hour()) continue;
+                double share = (hour - before.hour()) / (after.hour() - before.hour());
+                return before.median() + share * (after.median() - before.median());
+            }
+            return Double.NaN;
         }
 
         boolean eligible() {
@@ -56,6 +83,23 @@ final class StormFeedback {
             List<DailyPeriod> periods = dailyPeriods();
             return daily.amounts().size() == periods.size()
                     && periods.stream().allMatch(period -> daily.amounts().containsKey(period.start())) ? dailyTotal() : null;
+        }
+
+        Progress progress(Instant now) {
+            Snapshot window = measurementWindow();
+            if (wholeStorm != null && !now.isBefore(window.end())) {
+                return new Progress(window.end(), wholeStorm, window.medianThrough(window.end()));
+            }
+            if (daily.amounts().isEmpty()) return null;
+            Instant through = null;
+            double total = 0;
+            for (DailyPeriod period : dailyPeriods()) {
+                Double reading = daily.amounts().get(period.start());
+                if (reading == null || now.isBefore(period.end())) break;
+                total += reading;
+                through = period.end();
+            }
+            return through == null ? null : new Progress(through, total, window.medianThrough(through));
         }
 
         List<DailyPeriod> dailyPeriods() {
@@ -119,6 +163,35 @@ final class StormFeedback {
         return log;
     }
 
+    static StormFeedback readBackup(String serialized) throws JSONException {
+        StormFeedback log = read(serialized);
+        if (log.entries.size() != new JSONArray(serialized).length()) throw new JSONException("Invalid storm history");
+        return log;
+    }
+
+    void merge(StormFeedback imported) {
+        for (Entry incoming : imported.entries) {
+            int index = -1;
+            for (int i = 0; i < entries.size(); i++) {
+                Entry local = entries.get(i);
+                if (local.id().equals(incoming.id()) && FavoriteLocations.samePoint(local.site(), incoming.site())) {
+                    index = i;
+                    break;
+                }
+            }
+            if (index < 0) index = matchingEntry(incoming.site(), incoming.latest().start(), incoming.latest().end(), Collections.emptySet());
+            if (index < 0) {
+                entries.add(incoming);
+            } else {
+                Entry local = entries.get(index);
+                Entry base = !local.hasObservations() && incoming.hasObservations() ? incoming : local;
+                Snapshot latest = incoming.latest().retrieved().isAfter(local.latest().retrieved()) ? incoming.latest() : local.latest();
+                entries.set(index, new Entry(local.id(), local.site(), base.original(), latest, base.verification(),
+                        base.wholeStorm(), base.daily()));
+            }
+        }
+    }
+
     private static DailyLog readDaily(JSONObject row) {
         int cutoff = row.optInt("dailyCutoff", 0);
         if (cutoff < 0 || cutoff >= 24 * 60) return DailyLog.empty();
@@ -146,16 +219,28 @@ final class StormFeedback {
                 estimates.add(new ModelEstimate(estimate.getString("name"), estimate.getDouble("median")));
             }
         }
+        List<ForecastPoint> curve = new ArrayList<>();
+        JSONArray points = row.optJSONArray("curve");
+        if (points != null) {
+            for (int i = 0; i < points.length(); i++) {
+                JSONArray point = points.optJSONArray(i);
+                if (point == null) break;
+                int hour = point.optInt(0, -1);
+                double median = point.optDouble(1);
+                if (!validAmount(median) || (i == 0 ? hour != 0 : hour <= curve.get(i - 1).hour())) break;
+                curve.add(new ForecastPoint(hour, median));
+            }
+        }
         return new Snapshot(time(row, "retrieved"), start, end, ZoneOffset.ofTotalSeconds(row.getInt("offset")),
                 row.optDouble("low"), row.optDouble("median"), row.optDouble("high"), row.getString("models"),
-                estimates, row.optBoolean("complete", true));
+                estimates, row.optBoolean("complete", true), curve);
     }
 
     boolean archive(Forecast.Site site, Forecast forecast, Instant retrieved, SnowTimeline timeline) {
         Set<String> matched = new HashSet<>();
         boolean changed = false;
-        for (SnowTimeline.Event event : timeline.events) {
-            SnowTimeline.Stats stats = timeline.stats(event.first(), event.end());
+        for (SnowTimeline.Event event : timeline.stormEvents) {
+            SnowTimeline.Stats stats = timeline.stormStats(event);
             var midnight = forecast.start.atStartOfDay();
             Instant start = midnight.plusHours(event.first()).toInstant(forecast.offset);
             Instant end = midnight.plusHours(event.end()).toInstant(forecast.offset);
@@ -167,9 +252,12 @@ final class StormFeedback {
             }
             Snapshot snapshot = new Snapshot(retrieved, start, end, forecast.offset, stats.amount(.10),
                     stats.amount(.50), stats.amount(.90), String.join(" + ", names), estimates,
-                    !event.mayStartEarlier() && !event.mayContinue());
-            int index = matchingEntry(site, snapshot, matched);
+                    !event.mayStartEarlier() && !event.mayContinue(), Collections.emptyList());
+            int index = matchingEntry(site, start, end, matched);
             if (index < 0) {
+                if (snapshot.complete() && retrieved.isBefore(start) && !event.extended()) {
+                    snapshot = snapshot.withCurve(timeline, event);
+                }
                 Entry entry = new Entry(UUID.randomUUID().toString(), site, snapshot, snapshot,
                         snapshot.eligible() ? snapshot : null, null, DailyLog.empty());
                 entries.add(entry);
@@ -180,7 +268,10 @@ final class StormFeedback {
                 matched.add(entry.id());
                 if (!retrieved.isAfter(entry.latest().retrieved())) continue;
                 Snapshot verify = entry.verification();
-                if (verify == null && !entry.hasObservations() && snapshot.eligible()) verify = snapshot;
+                if (verify == null && !entry.hasObservations() && snapshot.eligible()) {
+                    if (!event.extended()) snapshot = snapshot.withCurve(timeline, event);
+                    verify = snapshot;
+                }
                 entries.set(index, new Entry(entry.id(), entry.site(), entry.original(), snapshot, verify,
                         entry.wholeStorm(), entry.daily()));
                 changed = true;
@@ -189,13 +280,18 @@ final class StormFeedback {
         return changed;
     }
 
-    private int matchingEntry(Forecast.Site site, Snapshot snapshot, Set<String> matched) {
+    Entry matchingEntry(Forecast.Site site, Instant start, Instant end) {
+        int index = matchingEntry(site, start, end, Collections.emptySet());
+        return index < 0 ? null : entries.get(index);
+    }
+
+    private int matchingEntry(Forecast.Site site, Instant start, Instant end, Set<String> matched) {
         int index = -1;
         long mostOverlap = 0;
         for (int i = 0; i < entries.size(); i++) {
             Entry e = entries.get(i);
             if (matched.contains(e.id()) || !FavoriteLocations.samePoint(site, e.site())) continue;
-            long overlap = e.latest().overlap(snapshot);
+            long overlap = e.latest().overlap(start, end);
             if (overlap > mostOverlap) {
                 index = i;
                 mostOverlap = overlap;
@@ -209,6 +305,26 @@ final class StormFeedback {
         for (Entry entry : entries) if (FavoriteLocations.samePoint(site, entry.site())) result.add(entry);
         result.sort(Comparator.comparing((Entry e) -> e.measurementWindow().start()).reversed());
         return result;
+    }
+
+    static NavigableMap<LocalDate, List<Entry>> calendarDates(List<Entry> entries, LocalDate before) {
+        NavigableMap<LocalDate, List<Entry>> dates = new TreeMap<>();
+        for (Entry entry : entries) {
+            Set<LocalDate> days = new HashSet<>();
+            addWindowDates(days, entry.original(), before);
+            addWindowDates(days, entry.latest(), before);
+            if (entry.verification() != null) addWindowDates(days, entry.verification(), before);
+            for (LocalDate day : days) dates.computeIfAbsent(day, key -> new ArrayList<>()).add(entry);
+        }
+        return dates;
+    }
+
+    private static void addWindowDates(Set<LocalDate> dates, Snapshot window, LocalDate before) {
+        LocalDate first = window.start().atOffset(window.offset()).toLocalDate();
+        LocalDate last = window.end().minusNanos(1).atOffset(window.offset()).toLocalDate();
+        for (LocalDate day = first; !day.isAfter(last) && day.isBefore(before); day = day.plusDays(1)) {
+            dates.add(day);
+        }
     }
 
     boolean observe(String id, Double snowfallInches, Instant now) {
@@ -308,11 +424,17 @@ final class StormFeedback {
         for (ModelEstimate model : s.estimates()) {
             estimates.put(new JSONObject().put("name", model.name()).put("median", model.median()));
         }
-        return new JSONObject().put("retrieved", s.retrieved().toEpochMilli()).put("start", s.start().toEpochMilli())
+        JSONObject row = new JSONObject().put("retrieved", s.retrieved().toEpochMilli()).put("start", s.start().toEpochMilli())
                 .put("end", s.end().toEpochMilli()).put("offset", s.offset().getTotalSeconds())
                 .put("low", jsonAmount(s.low())).put("median", jsonAmount(s.median()))
                 .put("high", jsonAmount(s.high())).put("models", s.models())
                 .put("estimates", estimates).put("complete", s.complete());
+        if (!s.curve().isEmpty()) {
+            JSONArray curve = new JSONArray();
+            for (ForecastPoint point : s.curve()) curve.put(new JSONArray().put(point.hour()).put(point.median()));
+            row.put("curve", curve);
+        }
+        return row;
     }
 
     private static Object jsonAmount(double value) { return Double.isFinite(value) ? value : JSONObject.NULL; }

@@ -22,7 +22,7 @@ record DisplayUnits(boolean celsius, boolean centimeters) {
         return (min == max ? Long.toString(min) : min + "° / " + max) + (celsius ? "°C" : "°F");
     }
 
-    private long temperature(double fahrenheit) {
+    long temperature(double fahrenheit) {
         return Math.round(celsius ? (fahrenheit - 32) * 5 / 9 : fahrenheit);
     }
 

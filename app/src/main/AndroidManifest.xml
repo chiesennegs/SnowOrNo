@@ -1,7 +1,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.snoworno.app">
     <uses-permission android:name="android.permission.INTERNET" />
     <application android:label="SnowOrNo" android:icon="@mipmap/app_icon"
-        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:theme="@style/SnowOrNo.Dark"
         android:supportsRtl="true" android:allowBackup="false" android:enableOnBackInvokedCallback="false">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

@@ -14,6 +14,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
@@ -41,9 +42,10 @@ final class ForecastSource {
         List<Callable<Feed>> requests = new ArrayList<>();
         for (String[] source : sources) {
             String url = String.format(Locale.US, "%s?latitude=%.6f&longitude=%.6f&elevation=%.1f"
-                            + "&models=%s&timezone=auto&forecast_days=%s"
+                            + "&models=%s&timezone=auto&forecast_days=%s&past_days=%d"
                             + "&wind_speed_unit=kmh&hourly=temperature_2m,snowfall,rain,cloud_cover,wind_speed_10m",
-                    ENDPOINT, site.latitude(), site.longitude(), site.feet() * .3048, source[0], source[2]);
+                    ENDPOINT, site.latitude(), site.longitude(), site.feet() * .3048, source[0], source[2],
+                    Forecast.STORM_LOOKBACK_DAYS);
             requests.add(() -> new Feed(source[1], read(url)));
         }
         var downloads = Executors.newFixedThreadPool(sources.length);
@@ -92,7 +94,7 @@ final class ForecastSource {
         return new Download(new Forecast(start, models, firstFutureHour, offset), received, accepted);
     }
 
-    private static JSONObject read(String address) throws Exception {
+    static JSONObject read(String address) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(address).openConnection();
         try {
             connection.setUseCaches(false);
@@ -156,9 +158,18 @@ final class ForecastSource {
             if (snowfall == null || temperature == null || rain == null || cloud == null) continue;
 
             Forecast.Hour[][] grid = new Forecast.Hour[Forecast.DAYS][24];
+            double[] earlierSnow = new double[Forecast.STORM_LOOKBACK_DAYS * 24];
+            Arrays.fill(earlierSnow, Double.NaN);
             for (int i = 0; i < days.length; i++) {
                 int d = days[i];
-                if (d < 0 || d >= grid.length) continue;
+                if (d < 0) {
+                    double s = snowfall.optDouble(i);
+                    if (d >= -Forecast.STORM_LOOKBACK_DAYS && Double.isFinite(s)) {
+                        earlierSnow[earlierSnow.length + d * 24 + hours[i]] = Math.max(0, s);
+                    }
+                    continue;
+                }
+                if (d >= grid.length) continue;
                 double s = snowfall.optDouble(i), t = temperature.optDouble(i);
                 double r = rain.optDouble(i), c = cloud.optDouble(i);
                 if (!Double.isFinite(t) || !Double.isFinite(s)
@@ -168,7 +179,7 @@ final class ForecastSource {
                 grid[d][hours[i]] = new Forecast.Hour(t, Math.max(0, s), Math.max(0, r), c,
                         solar(site.latitude(), dates[d], hours[i], c), windKph >= 0 ? windKph : Double.NaN);
             }
-            members.add(new Forecast.Member(grid));
+            members.add(new Forecast.Member(grid, earlierSnow));
         }
         return new Forecast(start, Collections.singletonList(new Forecast.Model(name, members)), now.getHour(), now.getOffset());
     }

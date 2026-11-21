@@ -1,0 +1,16 @@
+<resources>
+    <color name="snow_accent_dark">#8CD3FF</color>
+    <color name="snow_accent_light">#14578F</color>
+    <color name="snow_panel_dark">#132747</color>
+    <color name="snow_panel_light">#FCFEFF</color>
+
+    <style name="SnowOrNo.Dark" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:colorAccent">@color/snow_accent_dark</item>
+        <item name="android:colorBackgroundFloating">@color/snow_panel_dark</item>
+    </style>
+
+    <style name="SnowOrNo.Light" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:colorAccent">@color/snow_accent_light</item>
+        <item name="android:colorBackgroundFloating">@color/snow_panel_light</item>
+    </style>
+</resources>

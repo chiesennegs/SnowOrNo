@@ -4,7 +4,10 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.location.Address;
@@ -18,6 +21,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageButton;
 import android.widget.ImageView;
@@ -34,10 +38,13 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.time.YearMonth;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -48,9 +55,11 @@ import java.util.concurrent.Future;
 
 public final class MainActivity extends Activity {
     private static final int CALENDAR_TAB = 2;
+    private static final int IMPORT_HISTORY = 401, EXPORT_HISTORY = 402;
     private record CalendarOrigin(int tab, int scrollY) {}
+    private record HistoryMonth(WeatherHistoryStore.PlaceKey site, YearMonth month, LocalDate today) {}
 
-    private int bg, panel, line, ink, muted, mint, deep, warn;
+    private int bg, panel, line, ink, muted, accent, selectedFill, warn;
     private boolean lightMode, settingsOpen, feedbackOpen;
     private String dailyStormId;
     private DisplayUnits units;
@@ -83,20 +92,29 @@ public final class MainActivity extends Activity {
     private StormFeedback stormFeedback;
     private Forecast forecast;
     private ForecastCache forecastCache;
+    private WeatherHistoryStore weatherHistory;
+    private final ExecutorService historyWorker = Executors.newSingleThreadExecutor();
+    private Future<?> historyRequest;
+    private HistoryMonth historyMonth;
+    private WeatherHistoryStore.Month historicalWeather;
+    private boolean historyLoading, historyFailed, historyTransfer;
     private Instant retrievedAt;
     private SnowTimeline timeline;
     private LinearLayout root, body;
     private ScrollView scroller;
+    private TextView returnToTop;
     private boolean loading, showingCache;
     private long lastAttempt = -1;
     private PropertySnow.Surface surface = PropertySnow.Surface.LAWN;
     private boolean shade, showMeltDetails;
     private Future<?> activeRequest;
     private int request, tab;
-    private int calendarDay;
+    private LocalDate calendarDate;
     private CalendarOrigin calendarOrigin;
     private final Set<Instant> expandedStorms = new HashSet<>();
-    private int insetTop, insetBottom;
+    private final Set<Instant> collapsedStorms = new HashSet<>();
+    private final Set<String> collapsedHistory = new HashSet<>();
+    private int insetTop, insetBottom, insetRight;
 
     @Override
     public void onCreate(Bundle saved) {
@@ -111,11 +129,22 @@ public final class MainActivity extends Activity {
         surface = prefs.getBoolean("driveway", false) ? PropertySnow.Surface.PAVEMENT : PropertySnow.Surface.LAWN;
         shade = prefs.getBoolean("shade", false);
         forecastCache = new ForecastCache(new java.io.File(getCacheDir(), "forecasts"));
+        weatherHistory = new WeatherHistoryStore(this);
         scroller = new ScrollView(this);
         scroller.setBackgroundColor(bg);
         scroller.setFillViewport(true);
         scroller.setVerticalScrollBarEnabled(false);
         root = column();
+        returnToTop = action("↑", true, () -> scroller.smoothScrollTo(0, 0));
+        returnToTop.setTextSize(24);
+        returnToTop.setContentDescription("Return to top");
+        returnToTop.setTooltipText("Return to top");
+        returnToTop.setElevation(dp(6));
+        returnToTop.setVisibility(View.GONE);
+        FrameLayout screen = new FrameLayout(this);
+        screen.addView(scroller, new FrameLayout.LayoutParams(-1, -1));
+        screen.addView(returnToTop, new FrameLayout.LayoutParams(dp(52), dp(52), Gravity.BOTTOM | Gravity.RIGHT));
+        scroller.setOnScrollChangeListener((view, x, y, oldX, oldY) -> updateReturnToTop());
         updateInsets();
         root.setOnApplyWindowInsetsListener((view, insets) -> {
             if (android.os.Build.VERSION.SDK_INT >= 35) {
@@ -123,12 +152,13 @@ public final class MainActivity extends Activity {
                         | android.view.WindowInsets.Type.displayCutout());
                 insetTop = bars.top;
                 insetBottom = bars.bottom;
+                insetRight = bars.right;
                 updateInsets();
             }
             return insets;
         });
         scroller.addView(root);
-        setContentView(scroller);
+        setContentView(screen);
     }
 
     @Override
@@ -158,17 +188,26 @@ public final class MainActivity extends Activity {
 
     private void updateInsets() {
         root.setPadding(dp(20), dp(18) + insetTop, dp(20), dp(24) + insetBottom);
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams)returnToTop.getLayoutParams();
+        params.rightMargin = dp(18) + insetRight;
+        params.bottomMargin = dp(18) + insetBottom;
+        returnToTop.setLayoutParams(params);
+    }
+
+    private void updateReturnToTop() {
+        boolean stormList = !settingsOpen && (feedbackOpen ? dailyStormId == null : tab == 1 && forecast != null);
+        returnToTop.setVisibility(stormList && scroller.getScrollY() > dp(180) ? View.VISIBLE : View.GONE);
     }
 
     private void applyPalette() {
-        bg = lightMode ? 0xffeaf1f5 : 0xff0b1622;
-        panel = lightMode ? 0xffffffff : 0xff122432;
-        line = lightMode ? 0xffb4c4ce : 0xff2a4254;
-        ink = lightMode ? 0xff102638 : 0xffeef7fa;
-        muted = lightMode ? 0xff485e6d : 0xffadc1cd;
-        mint = lightMode ? 0xff006a58 : 0xff78e4cf;
-        deep = lightMode ? 0xffd7f3eb : 0xff0b3b3b;
-        warn = lightMode ? 0xff934700 : 0xffffc890;
+        bg = lightMode ? 0xffeaf4ff : 0xff0a1730;
+        panel = getColor(lightMode ? R.color.snow_panel_light : R.color.snow_panel_dark);
+        line = lightMode ? 0xffa9c3e0 : 0xff345681;
+        ink = lightMode ? 0xff112b4d : 0xfff3f8ff;
+        muted = lightMode ? 0xff405a7a : 0xffb9cce7;
+        accent = getColor(lightMode ? R.color.snow_accent_light : R.color.snow_accent_dark);
+        selectedFill = lightMode ? 0xffd8eaff : 0xff1b3b66;
+        warn = lightMode ? 0xff804216 : 0xffffd09a;
         getWindow().setStatusBarColor(bg);
         getWindow().setNavigationBarColor(bg);
         if (android.os.Build.VERSION.SDK_INT >= 30) {
@@ -236,6 +275,40 @@ public final class MainActivity extends Activity {
         appearance.setOnCheckedChangeListener((button, checked) -> saveSettings(units, checked));
         add(preferences, appearance, 15);
         add(root, preferences, 15);
+
+        LinearLayout snowAtLocation = card();
+        add(snowAtLocation, label("Snow at Location", 19, ink, true), 0);
+        add(snowAtLocation, action("Surface · " + surface.label, false, this::chooseSurface), 8);
+        add(snowAtLocation, action("Sun exposure · " + (shade ? "Mostly shaded" : "Open to sun"),
+                false, this::chooseExposure), 6);
+        add(root, snowAtLocation, 12);
+
+        LinearLayout legend = card();
+        add(legend, label("Calendar weather icons", 19, ink, true), 0);
+        for (Forecast.Weather weather : Forecast.Weather.values()) {
+            LinearLayout item = row();
+            item.addView(new WeatherIcon(weather), new LinearLayout.LayoutParams(dp(26), dp(26)));
+            TextView meaning = label(weather.label, 14, ink, false);
+            meaning.setPadding(dp(10), 0, 0, 0);
+            item.addView(meaning, new LinearLayout.LayoutParams(0, -2, 1));
+            add(legend, item, 5);
+        }
+        add(legend, label("Icing possible means the models show rain while the air is at or below freezing.",
+                13, muted, false), 7);
+        add(root, legend, 12);
+
+        LinearLayout history = card();
+        add(history, label("History backup", 19, ink, true), 0);
+        add(history, label("Includes downloaded weather history, saved storm forecasts, and snowfall measurements.",
+                13, muted, false), 5);
+        TextView export = action("Export history", false, () -> chooseHistoryFile(EXPORT_HISTORY));
+        TextView importFile = action("Import history", false, () -> chooseHistoryFile(IMPORT_HISTORY));
+        export.setEnabled(!historyTransfer);
+        importFile.setEnabled(!historyTransfer);
+        add(history, export, 8);
+        add(history, importFile, 6);
+        if (historyTransfer) add(history, label("Transferring history…", 13, muted, false), 6);
+        add(root, history, 12);
         add(root, action("About & support", false, this::showAbout), 12);
 
         root.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(1, 0, 1));
@@ -267,6 +340,72 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void chooseHistoryFile(int operation) {
+        boolean exporting = operation == EXPORT_HISTORY;
+        Intent intent = new Intent(exporting ? Intent.ACTION_CREATE_DOCUMENT : Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE).setType(exporting ? "application/gzip" : "*/*");
+        if (exporting) intent.putExtra(Intent.EXTRA_TITLE, "SnowOrNo-history.gz");
+        try {
+            startActivityForResult(intent, operation);
+        } catch (android.content.ActivityNotFoundException error) {
+            Toast.makeText(this, "File picker unavailable", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override protected void onActivityResult(int operation, int result, Intent data) {
+        super.onActivityResult(operation, result, data);
+        if ((operation != IMPORT_HISTORY && operation != EXPORT_HISTORY) || result != RESULT_OK || data == null) return;
+        Uri uri = data.getData();
+        if (uri == null || historyTransfer) return;
+        boolean exporting = operation == EXPORT_HISTORY;
+        final String storms;
+        try {
+            storms = exporting ? stormFeedback.serialize() : null;
+        } catch (JSONException error) {
+            Toast.makeText(this, "Couldn’t prepare storm history for export", Toast.LENGTH_LONG).show();
+            return;
+        }
+        historyTransfer = true;
+        renderAtScroll(scroller.getScrollY());
+        historyWorker.submit(() -> {
+            try {
+                StormFeedback imported = null;
+                if (exporting) {
+                    try (var output = getContentResolver().openOutputStream(uri, "wt")) {
+                        if (output == null) throw new java.io.IOException("Unable to open backup destination");
+                        weatherHistory.exportTo(output, storms);
+                    }
+                } else {
+                    try (var input = getContentResolver().openInputStream(uri)) {
+                        if (input == null) throw new java.io.IOException("Unable to open backup file");
+                        imported = weatherHistory.importFrom(input);
+                    }
+                }
+                StormFeedback restored = imported;
+                runOnUiThread(() -> finishHistoryTransfer(restored, exporting ? "History exported" : "History imported"));
+            } catch (Exception error) {
+                android.util.Log.w("SnowOrNo", "History transfer failed", error);
+                runOnUiThread(() -> finishHistoryTransfer(null,
+                        exporting ? "Couldn’t export history" : "Couldn’t import this history backup"));
+            }
+        });
+    }
+
+    private void finishHistoryTransfer(StormFeedback imported, String notice) {
+        if (imported != null) {
+            if (isDestroyed()) stormFeedback = StormFeedback.read(getPreferences(MODE_PRIVATE).getString("storm_feedback", "[]"));
+            stormFeedback.merge(imported);
+            saveFeedback();
+            if (historyRequest != null) historyRequest.cancel(true);
+            historyMonth = null;
+            historicalWeather = null;
+        }
+        historyTransfer = false;
+        if (isDestroyed()) return;
+        Toast.makeText(this, notice, Toast.LENGTH_LONG).show();
+        renderAtScroll(scroller.getScrollY());
+    }
+
     private void showAbout() {
         LinearLayout details = column();
         details.setPadding(dp(24), dp(8), dp(24), 0);
@@ -291,8 +430,12 @@ public final class MainActivity extends Activity {
         site = saved == null ? value : saved;
         putSelectedSite(getPreferences(MODE_PRIVATE).edit()).apply();
         setForecast(null);
-        calendarDay = 0;
+        calendarDate = null;
+        historyMonth = null;
+        if (historyRequest != null) historyRequest.cancel(true);
         expandedStorms.clear();
+        collapsedStorms.clear();
+        collapsedHistory.clear();
         if (calendarOrigin != null) calendarOrigin = new CalendarOrigin(calendarOrigin.tab(), 0);
         loadForecast();
     }
@@ -351,25 +494,27 @@ public final class MainActivity extends Activity {
     }
 
     private void setForecast(ForecastSource.Download entry) {
-        LocalDate previousDate = forecast == null ? null : forecast.start.plusDays(calendarDay);
         forecast = entry == null ? null : entry.forecast();
         retrievedAt = entry == null ? null : entry.retrievedAt();
         timeline = null;
-        if (forecast != null && previousDate != null) {
-            calendarDay = (int)Math.max(0, Math.min(Forecast.DAYS - 1, ChronoUnit.DAYS.between(forecast.start, previousDate)));
-        }
     }
 
     @Override
     protected void onDestroy() {
         worker.shutdownNow();
         locationWorker.shutdownNow();
+        if (historyRequest != null) historyRequest.cancel(true);
+        historyWorker.execute(weatherHistory::close);
+        historyWorker.shutdown();
         super.onDestroy();
     }
 
     private void render() {
         root.removeAllViews();
         scroller.setBackgroundColor(bg);
+        returnToTop.setTextColor(accent);
+        returnToTop.setBackground(shape(selectedFill, accent, 26));
+        updateReturnToTop();
         if (settingsOpen) {
             renderSettings();
             return;
@@ -385,6 +530,7 @@ public final class MainActivity extends Activity {
                 dailyStormId = null;
             }
             renderFeedback();
+            updateReturnToTop();
             return;
         }
         LinearLayout header = row();
@@ -445,7 +591,9 @@ public final class MainActivity extends Activity {
         add(root, tabs, 14);
         body = column();
         add(root, body, 15);
-        if (tab == CALENDAR_TAB) renderCalendarShortcuts();
+        List<StormFeedback.Entry> savedStorms = tab == CALENDAR_TAB ? stormFeedback.location(site) : Collections.emptyList();
+        LocalDate today = tab == CALENDAR_TAB ? calendarToday(savedStorms) : null;
+        if (tab == CALENDAR_TAB) renderCalendarShortcuts(today);
 
         if (forecast == null) {
             LinearLayout status = card();
@@ -453,41 +601,43 @@ public final class MainActivity extends Activity {
             add(status, label(loading ? "Requesting NOAA, ECMWF, and Canadian guidance."
                     : "No recent forecast is saved for this location. Check your connection and tap the refresh icon.", 14, muted, false), 8);
             add(body, status, tab == CALENDAR_TAB ? 10 : 0);
+            if (tab == CALENDAR_TAB) renderCalendar(savedStorms, today);
             add(body, action("Storm history", false, this::openFeedback), 12);
             return;
         }
 
         String sourceStatus = showingCache ? (loading ? "CACHED FORECAST · REFRESHING" : "CACHED FORECAST · LIVE UPDATE UNAVAILABLE")
                 : "LIVE MODEL GUIDANCE";
-        add(body, label(sourceStatus, 12, showingCache ? warn : mint, true), tab == CALENDAR_TAB ? 10 : 0);
-        add(body, label("Retrieved " + RETRIEVED.format(retrievedAt.atZone(ZoneId.systemDefault())), 12, muted, false), 3);
+        LinearLayout source = column();
+        add(source, label(sourceStatus, 12, showingCache ? warn : accent, true), 0);
+        add(source, label("Retrieved " + RETRIEVED.format(retrievedAt.atZone(ZoneId.systemDefault())), 12, muted, false), 3);
+        if (tab == 1) {
+            LinearLayout toolbar = row();
+            toolbar.addView(source, new LinearLayout.LayoutParams(0, -2, 1));
+            LinearLayout.LayoutParams history = new LinearLayout.LayoutParams(-2, -2);
+            history.setMarginStart(dp(8));
+            toolbar.addView(action("Storm history", false, this::openFeedback), history);
+            add(body, toolbar, 0);
+        } else {
+            add(body, source, tab == CALENDAR_TAB ? 10 : 0);
+        }
         if (tab == 0) renderLocation();
         if (tab == 1) renderStorm();
-        if (tab == CALENDAR_TAB) renderCalendar();
+        if (tab == CALENDAR_TAB) renderCalendar(savedStorms, today);
 
         TextView notes = action("Forecast methods & sources", false, this::showMethods);
         add(body, notes, 18);
     }
 
     private void renderLocation() {
-        LinearLayout focus = card();
-        add(focus, label("Snow at this location", 22, ink, true), 0);
-        LinearLayout options = row();
-        options.addView(action(surface.label, false, this::chooseSurface));
-        LinearLayout.LayoutParams margin = new LinearLayout.LayoutParams(-2, -2);
-        margin.leftMargin = dp(8);
-        options.addView(action(shade ? "Mostly shaded" : "Open to sun", false, this::chooseExposure), margin);
-        add(focus, options, 10);
-        add(body, focus, 10);
-
         PropertySnow.Result result = PropertySnow.project(forecast, surface, shade);
         LinearLayout totals = card();
-        add(totals, label("Next 72 hours", 15, mint, true), 0);
+        add(totals, label("Next 72 hours", 15, accent, true), 0);
         if (result.available()) {
             add(totals, label(range(result.peak().lower(), result.peak().upper()), 40, ink, true), 3);
             add(totals, label("Peak depth on " + surface.label.toLowerCase(Locale.US)
                     + "  ·  Median " + amount(result.peak().median()) + " " + units.depthUnit(), 14, muted, false), 3);
-            add(totals, label(percentage(result.oneInchShare()) + " of model guidance reaches " + (units.centimeters() ? "2.54 cm" : "1 in"), 14, mint, true), 12);
+            add(totals, label(percentage(result.oneInchShare()) + " of model guidance reaches " + (units.centimeters() ? "2.54 cm" : "1 in"), 14, accent, true), 12);
             add(totals, label("New snowfall  " + propertyDepth(result.fallen()), 14, ink, false), 9);
             add(totals, label("Depth after 72 hours  " + propertyDepth(result.remaining()), 14, ink, false), 5);
             addWeather(totals, forecast.conditions(forecast.firstFutureHour, forecast.firstFutureHour + 72));
@@ -502,14 +652,14 @@ public final class MainActivity extends Activity {
         add(timeline, label("Snow depth at midnight", 21, ink, true), 0);
         add(timeline, label("How much snow may be on your " + surface.label.toLowerCase(Locale.US)
                 + " at the end of each date, after new snow, melting, and settling. The forecast starts with a bare surface.", 14, muted, false), 5);
-        add(timeline, label("Local time  ·  Median depth (middle 80% of model estimates)", 12, mint, false), 8);
+        add(timeline, label("Local time  ·  Median depth (middle 80% of model estimates)", 12, accent, false), 8);
         for (int day = 0; day < result.days().length; day++) {
             PropertySnow.Day point = result.days()[day];
             LinearLayout entry = row();
             int targetDay = day;
             String date = dates(day, day + 1);
             TextView openDate = action(date, false, () -> openCalendar(targetDay));
-            openDate.setTextColor(mint);
+            openDate.setTextColor(accent);
             openDate.setContentDescription("Open " + date + " in Calendar");
             entry.addView(openDate);
             entry.addView(new View(this), new LinearLayout.LayoutParams(0, 0, 1));
@@ -533,7 +683,7 @@ public final class MainActivity extends Activity {
                 ? forecast.conditions(hour, hour + 1).low() : Double.NaN;
         String reading = Double.isFinite(current)
                 ? units.temperatures(current, current) + " (model estimate)" : "Unavailable";
-        add(place, label("Current temperature  ·  " + reading, 14, mint, true), 8);
+        add(place, label("Current temperature  ·  " + reading, 14, accent, true), 8);
         addDailyTemperature(place, "Today", today);
         addDailyTemperature(place, "Tomorrow", today + 1);
     }
@@ -578,37 +728,56 @@ public final class MainActivity extends Activity {
         if (timeline == null) timeline = new SnowTimeline(forecast);
 
         LinearLayout overview = card();
-        add(overview, label("Snowstorms", 24, ink, true), 0);
+        add(overview, label("Storm outlook", 18, ink, true), 0);
         add(overview, label(dates(0, Forecast.DAYS) + "  ·  Local time", 14, muted, false), 4);
-        add(overview, label("Days 15–30 show very-low-confidence signals with rough timing.", 13, muted, false), 7);
+        add(overview, confidenceButton("Days 15–30 · Very low confidence",
+                Forecast.EXTENDED_CONFIDENCE), 7);
         add(overview, label("Forecast model families have equal weight. Any local snowfall adjustment is shown as a trial preview.", 13, muted, false), 5);
-        add(overview, action("Storm history", false, this::openFeedback), 8);
         if (timeline.hasCoverageGaps()) {
             add(overview, label("Model coverage is incomplete for this forecast window.", 13, warn, true), 7);
         }
-        if (timeline.events.isEmpty()) {
+        if (timeline.stormEvents.isEmpty()) {
             add(overview, label(timeline.availableHours() == 0 ? "Storm guidance unavailable"
                     : "No storms meet the snowfall threshold in available guidance.", 15, ink, true), 8);
         }
-        add(body, overview, 10);
-
-        for (SnowTimeline.Event event : timeline.events) {
-            LinearLayout storm = card();
+        SnowTimeline.Event active = currentStorm(Instant.now());
+        List<SnowTimeline.Event> storms = new ArrayList<>(timeline.stormEvents);
+        if (active != null) {
+            storms.remove(active);
+            storms.add(0, active);
+        }
+        for (SnowTimeline.Event event : storms) {
+            boolean current = event.equals(active);
+            LinearLayout container = stormCard(current);
+            LinearLayout storm = column();
             boolean extended = event.extended();
-            add(storm, label(extended ? "Extended storm signal" : "Storm window", 20, mint, true), 0);
+            boolean inProgress = event.first() < timeline.firstHour;
             int first = event.first(), end = event.end();
             if (extended) {
-                first = first / 6 * 6;
+                first = Math.floorDiv(first, 6) * 6;
                 end = (end + 5) / 6 * 6;
             }
-            add(storm, label((extended ? "Approx. start  " : "Starts  ") + eventTime(first), 15, ink, false), 7);
+            SnowTimeline.Stats stats = timeline.stormStats(event);
+            Instant eventStart = forecastInstant(event.first());
+            String title = current ? "Current storm" : extended ? "Extended storm signal" : "Storm window";
+            String dates = (extended ? "Approx. " : "") + eventTime(first) + " – " + eventTime(end);
+            addStormToggle(container, storm, title, dates,
+                    expectedSnow(stats.amount(.10), stats.amount(.50), stats.amount(.90)), current,
+                    collapsedStorms, eventStart);
+
+            add(storm, label((extended ? "Approx. start  " : inProgress ? "Started  " : "Starts  ") + eventTime(first), 15, ink, false), 0);
             add(storm, label((extended ? "Approx. end  " : "Ends  ") + eventTime(end), 15, ink, false), 3);
             showEventBoundary(storm, event);
-            addWeather(storm, forecast.conditions(event.first(), event.end()));
+            int futureStart = Math.max(event.first(), timeline.firstHour);
+            addWeather(storm, forecast.conditions(futureStart, event.end()));
 
-            SnowTimeline.Stats stats = timeline.stats(event.first(), event.end());
             addDistribution(storm, event.mayStartEarlier() || event.mayContinue()
                     ? "Snowfall in the available window" : "Total new snowfall", stats);
+            if (stats.available()) {
+                addCumulativeSnowChart(storm, timeline.cumulative(event), first, end,
+                        inProgress ? timeline.firstHour : null);
+            }
+            if (inProgress) addStormProgress(storm, event);
             if (stats.available()) {
                 add(storm, label("Model guidance", 14, ink, true), 11);
                 for (SnowTimeline.ModelDetail model : stats.models) {
@@ -617,7 +786,6 @@ public final class MainActivity extends Activity {
                 }
                 LinearLayout breakdown = column();
                 addHistogram(breakdown, stats.buckets());
-                Instant eventStart = forecast.start.atStartOfDay().plusHours(event.first()).toInstant(forecast.offset);
                 boolean expanded = expandedStorms.contains(eventStart);
                 breakdown.setVisibility(expanded ? View.VISIBLE : View.GONE);
                 TextView show = action(expanded ? "Hide snowfall distribution" : "Show snowfall distribution", false, () -> {});
@@ -632,9 +800,57 @@ public final class MainActivity extends Activity {
                 add(storm, breakdown, 0);
                 addStormFeedback(storm, event, stats);
             }
-            add(storm, action("Open first day in Calendar", false, () -> openCalendar(event.first() / 24)), 9);
-            add(body, storm, 12);
+            add(storm, action(event.first() < 0 ? "Open today in Calendar" : "Open first day in Calendar",
+                    false, () -> openCalendar(Math.max(0, event.first() / 24))), 9);
+            add(body, container, 12);
         }
+        add(body, overview, 12);
+    }
+
+    private Instant forecastInstant(int hour) {
+        return forecast.start.atStartOfDay().plusHours(hour).toInstant(forecast.offset);
+    }
+
+    private SnowTimeline.Event currentStorm(Instant now) {
+        if (forecast == null) return null;
+        if (timeline == null) timeline = new SnowTimeline(forecast);
+        for (SnowTimeline.Event event : timeline.stormEvents) {
+            if (!now.isBefore(forecastInstant(event.first())) && now.isBefore(forecastInstant(event.end()))) return event;
+        }
+        return null;
+    }
+
+    private void addStormProgress(LinearLayout card, SnowTimeline.Event event) {
+        SnowTimeline.Stats elapsed = timeline.modeledSoFar(event);
+        SnowTimeline.Stats remaining = timeline.stats(timeline.firstHour, event.end());
+        addStormAmount(card, "Modeled so far", elapsed);
+        addStormAmount(card, "Forecast remaining", remaining);
+
+        StormFeedback.Entry entry = stormFeedback.matchingEntry(site, forecastInstant(event.first()), forecastInstant(event.end()));
+        StormFeedback.Progress progress = entry == null ? null : entry.progress(Instant.now());
+        if (progress == null) {
+            add(card, label("Record completed periods in Storm history to compare with a saved forecast.",
+                    12, muted, false), 5);
+            return;
+        }
+        var window = entry.measurementWindow();
+        String period = MEASUREMENT_TIME.format(window.start().atOffset(window.offset())) + " – "
+                + MEASUREMENT_TIME.format(progress.through().atOffset(window.offset()));
+        add(card, label("Measured " + amount(progress.measured()) + " " + units.depthUnit() + "  ·  " + period,
+                13, ink, true), 6);
+        String comparison = "Pre-storm estimate unavailable for that period";
+        if (Double.isFinite(progress.forecastMedian())) {
+            double error = progress.measured() - progress.forecastMedian();
+            comparison = "Saved pre-storm median " + amount(progress.forecastMedian()) + " " + units.depthUnit()
+                    + "  ·  Measured minus forecast " + (error > 0 ? "+" : "") + amount(error) + " " + units.depthUnit();
+        }
+        add(card, label(comparison, 12, muted, false), 4);
+    }
+
+    private void addStormAmount(LinearLayout card, String heading, SnowTimeline.Stats stats) {
+        String reading = stats.available() ? range(stats.amount(.10), stats.amount(.90)) + "  ·  Median "
+                + amount(stats.amount(.50)) + " " + units.depthUnit() : "Unavailable";
+        add(card, label(heading + "  ·  " + reading, 13, ink, true), 6);
     }
 
     private void addStormFeedback(LinearLayout card, SnowTimeline.Event event, SnowTimeline.Stats stats) {
@@ -677,7 +893,7 @@ public final class MainActivity extends Activity {
         }
         if (Double.isFinite(review.multiplier())) {
             String adjustment = String.format(Locale.US, "%+.0f%%", (review.multiplier() - 1) * 100);
-            add(tuning, label("Suggested trial adjustment  " + adjustment, 17, mint, true), 7);
+            add(tuning, label("Suggested trial adjustment  " + adjustment, 17, accent, true), 7);
             add(tuning, label("Storm cards preview the adjusted median alongside the original forecast.", 13, muted, false), 4);
         } else {
             add(tuning, label("A trial adjustment appears after " + StormFeedback.MIN_TUNING_STORMS
@@ -705,29 +921,44 @@ public final class MainActivity extends Activity {
                     15, muted, false), 15);
         } else {
             Instant now = Instant.now();
+            SnowTimeline.Event active = currentStorm(now);
+            StormFeedback.Entry activeEntry = active == null ? null
+                    : stormFeedback.matchingEntry(site, forecastInstant(active.first()), forecastInstant(active.end()));
+            if (forecast == null) {
+                activeEntry = entries.stream().filter(entry -> !now.isBefore(entry.latest().start()) && now.isBefore(entry.latest().end()))
+                        .max(java.util.Comparator.comparing(entry -> entry.latest().retrieved())).orElse(null);
+            }
             List<StormFeedback.Entry> upcoming = new ArrayList<>();
             List<StormFeedback.Entry> past = new ArrayList<>();
             for (StormFeedback.Entry entry : entries) {
-                (now.isBefore(entry.measurementWindow().end()) ? upcoming : past).add(entry);
+                (entry == activeEntry || now.isBefore(entry.measurementWindow().end()) ? upcoming : past).add(entry);
             }
             if (!upcoming.isEmpty()) {
                 add(root, label("Upcoming & in progress", 17, ink, true), 15);
-                for (int i = upcoming.size() - 1; i >= 0; i--) renderFeedbackEntry(upcoming.get(i));
+                for (int i = upcoming.size() - 1; i >= 0; i--) {
+                    StormFeedback.Entry entry = upcoming.get(i);
+                    renderFeedbackEntry(entry, entry == activeEntry);
+                }
             }
             if (!past.isEmpty()) {
                 add(root, label("Past forecast windows", 17, ink, true), 15);
-                for (StormFeedback.Entry entry : past) renderFeedbackEntry(entry);
+                for (StormFeedback.Entry entry : past) renderFeedbackEntry(entry, false);
             }
         }
     }
 
-    private void renderFeedbackEntry(StormFeedback.Entry entry) {
-        LinearLayout card = card();
+    private void renderFeedbackEntry(StormFeedback.Entry entry, boolean current) {
+        LinearLayout container = stormCard(current);
+        LinearLayout card = column();
+        StormFeedback.Snapshot latest = entry.latest();
+        addStormToggle(container, card, current ? "Current storm" : "Saved storm",
+                feedbackWindow(latest), expectedSnow(latest.low(), latest.median(), latest.high()),
+                current, collapsedHistory, entry.id());
         addFeedbackSnapshot(card, "Original forecast", entry.original());
         if (!entry.latest().equals(entry.original())) addFeedbackSnapshot(card, "Latest forecast", entry.latest());
 
         StormFeedback.Snapshot window = entry.measurementWindow();
-        add(card, label("Measurement window", 14, mint, true), 10);
+        add(card, label("Measurement window", 14, accent, true), 10);
         add(card, label(feedbackWindow(window), 14, ink, false), 4);
         if (entry.verification() != null && !window.equals(entry.original()) && !window.equals(entry.latest())) {
             add(card, label("Scored against " + range(window.low(), window.high()) + "  ·  Median "
@@ -773,11 +1004,11 @@ public final class MainActivity extends Activity {
             }
             add(card, controls, 9);
         }
-        add(root, card, 11);
+        add(root, container, 11);
     }
 
     private void addFeedbackSnapshot(LinearLayout card, String title, StormFeedback.Snapshot snapshot) {
-        add(card, label(title, 15, mint, true), 5);
+        add(card, label(title, 15, accent, true), 5);
         add(card, label(feedbackWindow(snapshot), 14, ink, false), 3);
         add(card, label(Double.isFinite(snapshot.median()) ? range(snapshot.low(), snapshot.high()) + "  ·  Median "
                 + amount(snapshot.median()) + " " + units.depthUnit() : "Complete snowfall guidance unavailable",
@@ -821,7 +1052,7 @@ public final class MainActivity extends Activity {
             add(summary, label("Daily cutoff  ·  " + cutoffTime + " local time", 14, muted, false), 7);
         }
         add(summary, label(amounts.size() + " of " + periods.size() + " periods recorded  ·  "
-                + amount(entry.dailyTotal()) + " " + units.depthUnit() + " logged", 14, mint, true), 8);
+                + amount(entry.dailyTotal()) + " " + units.depthUnit() + " logged", 14, accent, true), 8);
         if (entry.measured() == null) {
             add(summary, label("Enter every period, including 0 for a dry period, to score the storm.", 13, muted, false), 4);
         }
@@ -830,7 +1061,7 @@ public final class MainActivity extends Activity {
         Instant now = Instant.now();
         for (StormFeedback.DailyPeriod period : periods) {
             LinearLayout day = card();
-            add(day, label(dailyWindow(entry, period), 15, mint, true), 0);
+            add(day, label(dailyWindow(entry, period), 15, accent, true), 0);
             Double measurement = amounts.get(period.start());
             if (measurement != null) {
                 add(day, label("New snow  ·  " + amount(measurement) + " " + units.depthUnit(), 14, ink, true), 4);
@@ -920,7 +1151,7 @@ public final class MainActivity extends Activity {
     private void selectTab(int index) {
         if (index == tab) return;
         if (index == CALENDAR_TAB) {
-            openCalendar(calendarDay);
+            openCalendar(calendarDate);
         } else if (calendarOrigin != null && index == calendarOrigin.tab()) {
             returnFromCalendar();
         } else {
@@ -931,9 +1162,13 @@ public final class MainActivity extends Activity {
     }
 
     private void openCalendar(int day) {
+        openCalendar(forecast.start.plusDays(day));
+    }
+
+    private void openCalendar(LocalDate date) {
         calendarOrigin = new CalendarOrigin(tab, scroller.getScrollY());
         tab = CALENDAR_TAB;
-        calendarDay = day;
+        calendarDate = date;
         renderAtScroll(0);
     }
 
@@ -944,17 +1179,107 @@ public final class MainActivity extends Activity {
         renderAtScroll(origin.scrollY());
     }
 
-    private void renderCalendarShortcuts() {
+    private LocalDate calendarToday(List<StormFeedback.Entry> savedStorms) {
+        if (forecast != null) return LocalDate.now(forecast.offset);
+        if (historyMonth != null && historicalWeather != null && !historicalWeather.days().isEmpty()) {
+            return LocalDate.now(historicalWeather.zone());
+        }
+        return savedStorms.stream().max(Comparator.comparing(entry -> entry.latest().retrieved()))
+                .map(entry -> LocalDate.now(entry.latest().offset())).orElseGet(LocalDate::now);
+    }
+
+    private void renderCalendarShortcuts(LocalDate today) {
         LinearLayout shortcuts = row();
         if (calendarOrigin != null) shortcuts.addView(action("‹ Back", false, this::returnFromCalendar));
-        if (forecast != null) {
-            int today = (int)ChronoUnit.DAYS.between(forecast.start, LocalDate.now(forecast.offset));
-            if (today >= 0 && today < Forecast.DAYS) {
-                shortcuts.addView(new View(this), new LinearLayout.LayoutParams(0, 0, 1));
-                shortcuts.addView(action("Today", false, () -> selectDay(today)));
-            }
-        }
+        shortcuts.addView(new View(this), new LinearLayout.LayoutParams(0, 0, 1));
+        shortcuts.addView(action("Go to date", false, () -> chooseCalendarDate(today)));
+        LinearLayout.LayoutParams margin = new LinearLayout.LayoutParams(-2, -2);
+        margin.setMarginStart(dp(6));
+        shortcuts.addView(action("Today", false, () -> selectDate(today)), margin);
         add(body, shortcuts, 0);
+    }
+
+    private void chooseCalendarDate(LocalDate today) {
+        LocalDate first = today.minusYears(HistoricalWeather.YEARS);
+        LocalDate last = forecast == null ? today : forecast.start.plusDays(Forecast.DAYS - 1);
+        LocalDate date = calendarDate == null || calendarDate.isBefore(first) || calendarDate.isAfter(last) ? today : calendarDate;
+        var dialog = new android.app.DatePickerDialog(dialogContext(), (view, year, month, day) ->
+                selectDate(LocalDate.of(year, month + 1, day)), date.getYear(), date.getMonthValue() - 1, date.getDayOfMonth());
+        ZoneId device = ZoneId.systemDefault();
+        dialog.getDatePicker().setMinDate(first.atStartOfDay(device).toInstant().toEpochMilli());
+        dialog.getDatePicker().setMaxDate(last.atStartOfDay(device).toInstant().toEpochMilli());
+        dialog.show();
+    }
+
+    private void loadWeatherMonth(YearMonth month, LocalDate today) {
+        var job = new HistoryMonth(WeatherHistoryStore.PlaceKey.from(site), month, today);
+        if (job.equals(historyMonth)) return;
+        if (historyRequest != null) historyRequest.cancel(true);
+        historyMonth = job;
+        historicalWeather = null;
+        historyFailed = false;
+        LocalDate first = month.atDay(1);
+        LocalDate end = month.plusMonths(1).atDay(1);
+        LocalDate firstAllowed = today.minusYears(HistoricalWeather.YEARS);
+        LocalDate from = first.isBefore(firstAllowed) ? firstAllowed : first;
+        LocalDate last = end.isAfter(today) ? today.minusDays(1) : end.minusDays(1);
+        historyLoading = !last.isBefore(from);
+        if (!historyLoading) return;
+
+        Forecast.Site target = site;
+        ZoneId fallback = forecast == null ? ZoneOffset.UTC : forecast.offset;
+        historyRequest = historyWorker.submit(() -> {
+            WeatherHistoryStore.Month cached = null;
+            boolean failed = false;
+            try {
+                cached = weatherHistory.read(target, first, end, fallback);
+                var initial = cached;
+                runOnUiThread(() -> showWeatherMonth(job, initial, true, false));
+                LocalDate recentStart = HistoricalWeather.recentStart(today);
+                LocalDate archiveEnd = last.isBefore(recentStart) ? last : recentStart.minusDays(1);
+                LocalDate recentFrom = from.isBefore(recentStart) ? recentStart : from;
+                failed = !fetchMissingWeather(target, cached, from, archiveEnd, false);
+                if (Thread.currentThread().isInterrupted()) return;
+                failed |= !fetchMissingWeather(target, cached, recentFrom, last, true);
+                cached = weatherHistory.read(target, first, end, fallback);
+            } catch (Exception error) {
+                android.util.Log.w("SnowOrNo", "Weather history unavailable", error);
+                failed = true;
+            }
+            if (Thread.currentThread().isInterrupted()) return;
+            var downloaded = cached;
+            boolean unavailable = failed;
+            runOnUiThread(() -> showWeatherMonth(job, downloaded, false, unavailable));
+        });
+    }
+
+    private boolean fetchMissingWeather(Forecast.Site target, WeatherHistoryStore.Month cached,
+                                        LocalDate first, LocalDate last, boolean recent) {
+        LocalDate missingStart = null, missingEnd = null;
+        for (LocalDate date = first; !date.isAfter(last); date = date.plusDays(1)) {
+            var day = cached.days().get(date);
+            if (day != null && day.complete() && (recent || !day.recent())) continue;
+            if (missingStart == null) missingStart = date;
+            missingEnd = date;
+        }
+        if (missingStart == null) return true;
+        try {
+            var batch = HistoricalWeather.fetch(target, missingStart, missingEnd, recent);
+            if (Thread.currentThread().isInterrupted()) return false;
+            weatherHistory.save(target, batch);
+            return true;
+        } catch (Exception error) {
+            android.util.Log.w("SnowOrNo", "Historical model data unavailable", error);
+            return false;
+        }
+    }
+
+    private void showWeatherMonth(HistoryMonth job, WeatherHistoryStore.Month month, boolean loading, boolean failed) {
+        if (isDestroyed() || historyMonth != job) return;
+        historicalWeather = month;
+        historyLoading = loading;
+        historyFailed = failed;
+        if (tab == CALENDAR_TAB && !settingsOpen && !feedbackOpen) renderAtScroll(scroller.getScrollY());
     }
 
     private void addWeather(LinearLayout section, Forecast.Conditions conditions) {
@@ -986,25 +1311,33 @@ public final class MainActivity extends Activity {
             bucket.addView(range, new LinearLayout.LayoutParams(dp(113), -2));
             View track = new ProbabilityBar(buckets[i]);
             bucket.addView(track, new LinearLayout.LayoutParams(0, dp(10), 1));
-            TextView percent = label(percentage(buckets[i]), 14, mint, true);
+            TextView percent = label(percentage(buckets[i]), 14, accent, true);
             percent.setGravity(Gravity.END);
             bucket.addView(percent, new LinearLayout.LayoutParams(dp(51), -2));
             add(distribution, bucket, 12);
         }
     }
 
-    private void renderCalendar() {
-        if (timeline == null) timeline = new SnowTimeline(forecast);
+    private void renderCalendar(List<StormFeedback.Entry> savedStorms, LocalDate today) {
+        if (timeline == null && forecast != null) timeline = new SnowTimeline(forecast);
+        LocalDate firstForecast = forecast == null ? today.plusDays(1) : forecast.start;
+        LocalDate last = forecast == null ? today : firstForecast.plusDays(Forecast.DAYS - 1);
+        var history = StormFeedback.calendarDates(savedStorms, firstForecast);
+        LocalDate first = today.minusYears(HistoricalWeather.YEARS);
+        LocalDate selected = calendarDate == null || calendarDate.isBefore(first) || calendarDate.isAfter(last)
+                ? today : calendarDate;
+        int calendarDay = (int)ChronoUnit.DAYS.between(firstForecast, selected);
 
         LinearLayout month = card();
-        LocalDate selected = forecast.start.plusDays(calendarDay);
+        month.setPadding(dp(8), dp(15), dp(8), dp(15));
         YearMonth current = YearMonth.from(selected);
+        loadWeatherMonth(current, today);
         LinearLayout monthHeader = row();
-        addMonthButton(monthHeader, "‹", current.minusMonths(1));
+        addMonthButton(monthHeader, "‹", current.minusMonths(1), first, last);
         TextView title = label(current.format(MONTH), 18, ink, true);
         title.setGravity(Gravity.CENTER);
         monthHeader.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
-        addMonthButton(monthHeader, "›", current.plusMonths(1));
+        addMonthButton(monthHeader, "›", current.plusMonths(1), first, last);
         add(month, monthHeader, 0);
 
         LinearLayout weekdays = row();
@@ -1018,41 +1351,49 @@ public final class MainActivity extends Activity {
         int cells = ((offset + current.lengthOfMonth() + 6) / 7) * 7;
         for (int week = 0; week < cells; week += 7) {
             LinearLayout days = row();
+            days.setMinimumHeight(dp(88));
             for (int slot = week; slot < week + 7; slot++) {
                 int date = slot - offset + 1;
                 View cell = new View(this);
                 if (date > 0 && date <= current.lengthOfMonth()) {
                     LocalDate target = current.atDay(date);
-                    int day = (int)ChronoUnit.DAYS.between(forecast.start, target);
-                    boolean selectable = day >= 0 && day < Forecast.DAYS;
-                    boolean storm = selectable && timeline.events.stream().anyMatch(event -> event.overlaps(day * 24, (day + 1) * 24));
-                    if (selectable) {
-                        TextView button = action(Integer.toString(date), day == calendarDay, () -> selectDay(day));
-                        button.setTextColor(storm ? mint : (day < SnowTimeline.DAILY_DAYS ? ink : muted));
-                        button.setContentDescription(target.format(DATE) + (storm ? ", storm window" : ""));
-                        button.setPadding(0, 0, 0, 0);
-                        cell = button;
+                    int day = (int)ChronoUnit.DAYS.between(firstForecast, target);
+                    boolean liveDay = forecast != null && day >= 0 && day < Forecast.DAYS;
+                    boolean archived = !target.isBefore(first) && history.containsKey(target);
+                    boolean pastDay = !target.isBefore(first) && target.isBefore(today);
+                    if (liveDay || archived || pastDay) {
+                        boolean storm = archived || (liveDay && timeline.events.stream().anyMatch(event -> event.overlaps(day * 24, (day + 1) * 24)));
+                        Forecast.Summary weather = liveDay ? forecast.summarize(day, day + 1) : null;
+                        var past = historicalWeather == null ? null : historicalWeather.days().get(target);
+                        cell = calendarDateCell(target, target.equals(selected), storm, archived, weather, past);
                     } else {
-                        TextView inactive = label(Integer.toString(date), 13, 0xff708495, false);
+                        TextView inactive = label(Integer.toString(date), 13, muted, false);
                         inactive.setGravity(Gravity.CENTER);
                         cell = inactive;
                     }
                 }
-                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, dp(43), 1);
+                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -1, 1);
                 params.setMargins(dp(1), 0, dp(1), 0);
                 days.addView(cell, params);
             }
             add(month, days, 3);
         }
-        add(month, label("Mint dates mark a modeled storm. Extended outlook begins on day 15.", 12, muted, false), 8);
+        add(month, label("Low above high (" + (units.celsius() ? "°C" : "°F") + ") · Blue dates mark forecast or archived storms."
+                + " Extended outlook begins on day 15.", 12, muted, false), 8);
         add(body, month, 10);
 
+        if (forecast == null || calendarDay < 0) {
+            renderArchivedCalendarDay(selected, today, history.getOrDefault(selected, Collections.emptyList()));
+            return;
+        }
+        Forecast.Summary selectedWeather = forecast.summarize(calendarDay, calendarDay + 1);
         if (calendarDay >= SnowTimeline.DAILY_DAYS) {
-            int first = SnowTimeline.DAILY_DAYS + (calendarDay - SnowTimeline.DAILY_DAYS) / 7 * 7;
+            int firstOutlookDay = SnowTimeline.DAILY_DAYS + (calendarDay - SnowTimeline.DAILY_DAYS) / 7 * 7;
             LinearLayout extended = card();
             add(extended, label(selected.format(DATE) + " · Extended outlook", 20, ink, true), 0);
+            addCalendarWeather(extended, selectedWeather);
             add(extended, label("Extended dates show multi-day guidance. Hourly detail is shown through day 14.", 14, muted, false), 4);
-            addOutlookRow(extended, first, Math.min(first + 7, Forecast.DAYS), true);
+            addOutlookRow(extended, firstOutlookDay, Math.min(firstOutlookDay + 7, Forecast.DAYS), true);
             add(body, extended, 12);
             renderCalendarStorms(calendarDay * 24, (calendarDay + 1) * 24);
             return;
@@ -1063,19 +1404,23 @@ public final class MainActivity extends Activity {
         LinearLayout dayCard = card();
         add(dayCard, label(selected.format(DateTimeFormatter.ofPattern("EEEE, MMM d", Locale.US)),
                 22, ink, true), 0);
-        Forecast.Summary weather = forecast.summarize(calendarDay, calendarDay + 1);
-        if (weather.available()) {
-            add(dayCard, label(weather.weather() + "  ·  Rain " + liquid(weather.rain(.5))
+        if (selectedWeather.available()) {
+            addCalendarWeather(dayCard, selectedWeather);
+            add(dayCard, label("Rain " + liquid(selectedWeather.rain(.5))
                     + " " + units.depthUnit(), 14, muted, false), 5);
-            addWeather(dayCard, weather.conditions());
+            add(dayCard, label(windText(selectedWeather.conditions()), 14, muted, false), 3);
         }
-        SnowTimeline.Stats dailySnow = timeline.stats(Math.max(dayStart, timeline.firstHour), dayEnd);
+        int availableStart = Math.max(dayStart, timeline.firstHour);
+        SnowTimeline.Stats dailySnow = timeline.stats(availableStart, dayEnd);
         addDistribution(dayCard, calendarDay == 0 && timeline.firstHour > 0 ? "Snowfall for the rest of today" : "Day snowfall", dailySnow);
+        if (dailySnow.available()) {
+            addCumulativeSnowChart(dayCard, timeline.cumulative(availableStart, dayEnd, 1), availableStart, dayEnd, null);
+        }
         SnowTimeline.Stats[] rates = new SnowTimeline.Stats[24];
         for (int hour = 0; hour < rates.length; hour++) rates[hour] = timeline.stats(dayStart + hour, dayStart + hour + 1);
         add(dayCard, label("Hourly snowfall", 17, ink, true), 12);
         add(dayCard, new HourChart(rates), 4, dp(120));
-        add(dayCard, label("Mint bars show the median. Thin lines show the middle 80%.", 12, muted, false), 3);
+        add(dayCard, label("Blue bars show the median. Thin lines show the middle 80%.", 12, muted, false), 3);
         if (dailySnow.available()) addHistogram(dayCard, dailySnow.buckets());
         add(body, dayCard, 12);
 
@@ -1083,12 +1428,147 @@ public final class MainActivity extends Activity {
         renderHours(dayStart, rates);
     }
 
+    private LinearLayout calendarDateCell(LocalDate date, boolean selected, boolean storm, boolean archived,
+                                          Forecast.Summary weather, HistoricalWeather.Day past) {
+        LinearLayout cell = column();
+        cell.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        cell.setPadding(dp(3), dp(6), dp(3), dp(9));
+        cell.setBackground(shape(selected ? selectedFill : panel, selected ? accent : line, 8));
+        cell.setSelected(selected);
+        cell.setFocusable(true);
+        cell.setOnClickListener(view -> selectDate(date));
+        TextView number = label(Integer.toString(date.getDayOfMonth()), 14,
+                storm ? accent : weather == null || weather.first < SnowTimeline.DAILY_DAYS ? ink : muted, true);
+        number.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        cell.addView(number);
+
+        String description = date.format(DATE) + (storm ? ", storm window" : "");
+        boolean forecastAvailable = weather != null && weather.available();
+        if (forecastAvailable || past != null) {
+            Forecast.Weather condition = forecastAvailable ? weather.weatherIcon() : past.condition();
+            if (condition != null) cell.addView(new WeatherIcon(condition), new LinearLayout.LayoutParams(dp(21), dp(21)));
+            String unit = units.celsius() ? " Celsius" : " Fahrenheit";
+            long low = units.temperature(forecastAvailable ? weather.low() : past.lowF());
+            long high = units.temperature(forecastAvailable ? weather.high() : past.highF());
+            for (long temperature : new long[]{low, high}) {
+                TextView value = label(temperature + "°", 11, ink, false);
+                value.setIncludeFontPadding(false);
+                value.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                LinearLayout.LayoutParams spacing = new LinearLayout.LayoutParams(-2, -2);
+                spacing.topMargin = dp(2);
+                cell.addView(value, spacing);
+            }
+            if (condition != null) description += ", " + condition.label;
+            description += ", low " + low + unit + ", high " + high + unit;
+        } else if (archived) {
+            cell.addView(new WeatherIcon(Forecast.Weather.SNOW), new LinearLayout.LayoutParams(dp(21), dp(21)));
+            description += ", archived storm forecast";
+        } else {
+            cell.addView(label("—", 13, muted, false));
+            description += ", daily weather unavailable";
+        }
+        cell.setContentDescription(description);
+        return cell;
+    }
+
+    private void renderArchivedCalendarDay(LocalDate date, LocalDate today, List<StormFeedback.Entry> storms) {
+        LinearLayout card = card();
+        add(card, label(date.format(DateTimeFormatter.ofPattern("EEEE, MMM d, yyyy", Locale.US)), 22, ink, true), 0);
+        var history = historicalWeather == null ? null : historicalWeather.days().get(date);
+        if (history != null) {
+            addHistoricalDay(card, history);
+        } else if (date.isBefore(today)) {
+            add(card, label(historyLoading ? "Loading historical weather…" : "Historical weather unavailable", 14, muted, false), 6);
+        } else {
+            add(card, label("Today’s forecast is unavailable", 14, muted, false), 6);
+        }
+        if (date.isBefore(today) && !historyLoading && (historyFailed || history == null)) {
+            add(card, action("Retry weather history", false, () -> {
+                historyMonth = null;
+                renderAtScroll(scroller.getScrollY());
+            }), 8);
+        }
+        for (StormFeedback.Entry storm : storms) {
+            addFeedbackSnapshot(card, "Original storm forecast", storm.original());
+            if (!storm.latest().equals(storm.original())) addFeedbackSnapshot(card, "Latest saved forecast", storm.latest());
+            Double measured = storm.measured();
+            if (measured != null) {
+                add(card, label("Measured storm total  ·  " + amount(measured) + " " + units.depthUnit(),
+                        14, ink, true), 6);
+            } else if (storm.hasObservations()) {
+                add(card, label("Daily measurements logged  ·  " + amount(storm.dailyTotal()) + " " + units.depthUnit(),
+                        14, ink, true), 6);
+            }
+        }
+        if (!storms.isEmpty()) add(card, action("Storm history", false, this::openFeedback), 10);
+        add(body, card, 12);
+        if (history != null) renderHistoricalHours(history, historicalWeather.zone());
+    }
+
+    private void addHistoricalDay(LinearLayout card, HistoricalWeather.Day day) {
+        add(card, label(day.recent() ? "Recent model estimate · Open-Meteo" : "Historical reanalysis · Open-Meteo ERA5 Seamless",
+                12, accent, true), 6);
+        String weather = day.condition() == null ? "" : day.condition().label + "  ·  ";
+        add(card, label(weather + "Low / high " + units.temperatures(day.lowF(), day.highF()), 14, ink, true), 6);
+        String period = day.complete() ? "" : "Recorded hours · ";
+        add(card, label(period + "Rain " + historyDepth(day.rainIn()) + "  ·  New snow " + historyDepth(day.snowIn()),
+                14, ink, false), 5);
+        if (!day.complete()) {
+            add(card, label("Partial day · " + day.hours().size() + " of " + day.expectedHours() + " hours available",
+                    13, warn, false), 5);
+        }
+    }
+
+    private String historyDepth(double inches) {
+        return Double.isFinite(inches) ? liquid(inches) + " " + units.depthUnit() : "Unavailable";
+    }
+
+    private String hourlyHistoricalDepth(int value, double divisor) {
+        return value == HistoricalWeather.MISSING ? "—" : liquid(value / divisor);
+    }
+
+    private void renderHistoricalHours(HistoricalWeather.Day day, ZoneId zone) {
+        LinearLayout card = card();
+        add(card, label("Historical weather by hour", 21, ink, true), 0);
+        add(card, label("Local time · Snow, rain and depth in " + units.depthUnit() + " · Wind in " + units.windUnit(),
+                12, muted, false), 4);
+        var clock = DateTimeFormatter.ofPattern("h:mm a z", Locale.US);
+        var scroll = new HorizontalScrollView(this);
+        scroll.setFillViewport(true);
+        var table = new TableLayout(this);
+        table.setStretchAllColumns(true);
+        table.addView(hourRow(true, "Starts", "Air", "Rain", "New snow", "Snow depth", "Wind", "Gust"));
+        for (var hour : day.hours()) {
+            double temp = Forecast.fahrenheit(hour.temperature() / 10.0);
+            table.addView(hourRow(false, clock.format(Instant.ofEpochSecond(hour.time()).atZone(zone)),
+                    units.temperatures(temp, temp), hourlyHistoricalDepth(hour.rain(), 254.0),
+                    hourlyHistoricalDepth(hour.snow(), 25.4), hourlyHistoricalDepth(hour.depth(), 25.4),
+                    hour.wind() == HistoricalWeather.MISSING ? "—" : units.windValue(hour.wind() / 10.0),
+                    hour.gust() == HistoricalWeather.MISSING ? "—" : units.windValue(hour.gust() / 10.0)));
+        }
+        scroll.addView(table);
+        add(card, scroll, 8);
+        add(body, card, 12);
+    }
+
+    private void addCalendarWeather(LinearLayout card, Forecast.Summary weather) {
+        if (!weather.available()) return;
+        Forecast.Weather condition = weather.weatherIcon();
+        LinearLayout summary = row();
+        summary.addView(new WeatherIcon(condition), new LinearLayout.LayoutParams(dp(24), dp(24)));
+        TextView text = label(condition.label + "  ·  Low / high " + units.temperatures(weather.low(), weather.high()),
+                14, ink, false);
+        text.setPadding(dp(8), 0, 0, 0);
+        summary.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
+        add(card, summary, 5);
+    }
+
     private void renderCalendarStorms(int dayStart, int dayEnd) {
         for (SnowTimeline.Event event : timeline.events) {
             if (!event.overlaps(dayStart, dayEnd)) continue;
             LinearLayout storm = card();
             add(storm, label(event.extended() ? "Extended storm signal" : event.first() / 24 != (event.end() - 1) / 24
-                    ? "Storm spans multiple days" : "Storm window", 20, mint, true), 0);
+                    ? "Storm spans multiple days" : "Storm window", 20, accent, true), 0);
             int first = event.extended() ? event.first() / 6 * 6 : event.first();
             int end = event.extended() ? (event.end() + 5) / 6 * 6 : event.end();
             add(storm, label((event.extended() ? "Approx. " : "") + eventTime(first) + " → " + eventTime(end), 14, ink, false), 5);
@@ -1102,13 +1582,11 @@ public final class MainActivity extends Activity {
 
     }
 
-    private void addMonthButton(LinearLayout parent, String symbol, YearMonth target) {
-        LocalDate start = forecast.start;
-        LocalDate end = start.plusDays(Forecast.DAYS - 1);
-        boolean enabled = !target.atEndOfMonth().isBefore(start) && !target.atDay(1).isAfter(end);
+    private void addMonthButton(LinearLayout parent, String symbol, YearMonth target, LocalDate first, LocalDate last) {
+        boolean enabled = !target.atEndOfMonth().isBefore(first) && !target.atDay(1).isAfter(last);
         TextView button = action(symbol, false, () -> {
-            LocalDate first = target.atDay(1);
-            selectDay((int)ChronoUnit.DAYS.between(start, first.isBefore(start) ? start : first));
+            LocalDate start = target.atDay(1);
+            selectDate(start.isBefore(first) ? first : start);
         });
         button.setContentDescription(symbol.equals("‹") ? "Previous month" : "Next month");
         button.setEnabled(enabled);
@@ -1116,8 +1594,8 @@ public final class MainActivity extends Activity {
         parent.addView(button);
     }
 
-    private void selectDay(int day) {
-        calendarDay = day;
+    private void selectDate(LocalDate date) {
+        calendarDate = date;
         renderAtScroll(scroller.getScrollY());
     }
 
@@ -1145,7 +1623,18 @@ public final class MainActivity extends Activity {
         }
         add(card, label(range(stats.amount(.10), stats.amount(.90)), 35, ink, true), 3);
         add(card, label("Middle 80% of model guidance  ·  Median " + amount(stats.amount(.50)) + " " + units.depthUnit(), 13, muted, false), 3);
-        add(card, label(stats.confidence() + " confidence  ·  " + stats.count() + " members", 14, mint, true), 5);
+        Forecast.Confidence confidence = stats.confidence();
+        add(card, confidenceButton(confidence.rating() + " confidence  ·  " + stats.count() + " members", confidence), 5);
+    }
+
+    private TextView confidenceButton(String text, Forecast.Confidence confidence) {
+        TextView button = action(text + "  ⓘ", false, () -> dialogBuilder()
+                .setTitle("Forecast confidence · " + confidence.rating())
+                .setMessage(confidence.reason())
+                .setPositiveButton("Done", null).show());
+        button.setTextColor(accent);
+        button.setContentDescription(text + ". Explain confidence rating");
+        return button;
     }
 
     private void renderHours(int dayStart, SnowTimeline.Stats[] rates) {
@@ -1185,7 +1674,7 @@ public final class MainActivity extends Activity {
     private TableRow hourRow(boolean header, String... values) {
         TableRow row = new TableRow(this);
         for (int column = 0; column < values.length; column++) {
-            TextView cell = label(values[column], 13, header ? mint : ink, header);
+            TextView cell = label(values[column], 13, header ? accent : ink, header);
             cell.setSingleLine(true);
             cell.setIncludeFontPadding(false);
             cell.setGravity(column == 0 ? Gravity.START : Gravity.END);
@@ -1207,8 +1696,8 @@ public final class MainActivity extends Activity {
         add(section, divider, 12, dp(1));
         LinearLayout head = row();
         head.addView(label(dates(first, end), 16, ink, true), new LinearLayout.LayoutParams(0, -2, 1));
-        TextView confidence = label(value.confidence(), 13, value.confidence().equals("Higher") ? mint : muted, true);
-        head.addView(confidence);
+        Forecast.Confidence confidence = value.confidence();
+        head.addView(confidenceButton(confidence.rating(), confidence));
         add(section, head, 10);
         if (!value.available()) return;
         String pattern = extended ? (value.snow(.50) >= .1 || value.rain(.50) >= .05
@@ -1230,7 +1719,7 @@ public final class MainActivity extends Activity {
             View divider = new View(this);
             divider.setBackgroundColor(line);
             add(detail, divider, 12, dp(1));
-            add(detail, label("Through " + dates(d, d + 1), 16, mint, true), 9);
+            add(detail, label("Through " + dates(d, d + 1), 16, accent, true), 9);
             if (!part.available()) {
                 add(detail, label("Unavailable", 14, muted, false), 3);
                 continue;
@@ -1290,7 +1779,7 @@ public final class MainActivity extends Activity {
             add(details, label(String.format(Locale.US, "%.4f°, %.4f°  ·  %,d ft",
                     favorite.latitude(), favorite.longitude(), favorite.feet()), 12, muted, false), 2);
             boolean selected = FavoriteLocations.samePoint(site, favorite);
-            if (selected) add(details, label("Current location", 12, mint, false), 2);
+            if (selected) add(details, label("Current location", 12, accent, false), 2);
             details.setContentDescription("Open forecast for " + favorite.name());
             details.setFocusable(true);
             details.setOnClickListener(view -> {
@@ -1442,7 +1931,7 @@ public final class MainActivity extends Activity {
     private void showMap() {
         LinearLayout panel = column();
         panel.setPadding(dp(14), 0, dp(14), 0);
-        TextView coordinates = label("", 14, mint, true);
+        TextView coordinates = label("", 14, accent, true);
         LocationMap map = new LocationMap(this, site.latitude(), site.longitude(),
                 (latitude, longitude) -> coordinates.setText(mapCoordinates(latitude, longitude)));
         coordinates.setText(mapCoordinates(map.latitude(), map.longitude()));
@@ -1556,7 +2045,7 @@ public final class MainActivity extends Activity {
 
     private android.view.ContextThemeWrapper dialogContext() {
         return new android.view.ContextThemeWrapper(this, lightMode
-                ? android.R.style.Theme_Material_Light : android.R.style.Theme_Material);
+                ? R.style.SnowOrNo_Light : R.style.SnowOrNo_Dark);
     }
 
     private AlertDialog.Builder dialogBuilder() {
@@ -1612,6 +2101,52 @@ public final class MainActivity extends Activity {
         return card;
     }
 
+    private LinearLayout stormCard(boolean current) {
+        LinearLayout card = card();
+        if (current) card.setBackground(shape(selectedFill, accent, 20));
+        return card;
+    }
+
+    private String expectedSnow(double low, double median, double high) {
+        if (!Double.isFinite(median)) return "Expected snowfall unavailable";
+        String medianText = amount(median) + " " + units.depthUnit();
+        return "Expected snow " + (Double.isFinite(low) && Double.isFinite(high)
+                ? range(low, high) + "  ·  Median " + medianText : medianText);
+    }
+
+    private <T> void addStormToggle(LinearLayout card, LinearLayout details, String name, String dates,
+                                    String snowfall, boolean current, Set<T> collapsed, T key) {
+        LinearLayout header = row();
+        LinearLayout text = column();
+        TextView title = label(name, 20, accent, true);
+        add(text, title, 0);
+        LinearLayout summary = column();
+        add(summary, label(dates, 15, current ? accent : ink, true), 0);
+        add(summary, label(snowfall, 13, ink, false), 3);
+        add(text, summary, 0);
+        header.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
+        TextView caret = action("", false, () -> {});
+        caret.setTextSize(20);
+        LinearLayout.LayoutParams buttonParams = new LinearLayout.LayoutParams(dp(48), dp(48));
+        buttonParams.setMarginStart(dp(8));
+        header.addView(caret, buttonParams);
+        add(card, header, 0);
+        add(card, details, 7);
+        Runnable update = () -> {
+            boolean closed = collapsed.contains(key);
+            details.setVisibility(closed ? View.GONE : View.VISIBLE);
+            title.setVisibility(closed ? View.GONE : View.VISIBLE);
+            summary.setVisibility(closed ? View.VISIBLE : View.GONE);
+            caret.setText(closed ? "▾" : "▴");
+            caret.setContentDescription((closed ? "Expand " : "Collapse ") + name.toLowerCase(Locale.US) + ", " + dates);
+        };
+        caret.setOnClickListener(view -> {
+            if (!collapsed.remove(key)) collapsed.add(key);
+            update.run();
+        });
+        update.run();
+    }
+
     private TextView label(String text, int size, int color, boolean bold) {
         TextView view = new TextView(this);
         view.setText(text);
@@ -1622,11 +2157,11 @@ public final class MainActivity extends Activity {
     }
 
     private TextView action(String text, boolean selected, Runnable callback) {
-        TextView view = label(text, 14, selected ? mint : ink, true);
+        TextView view = label(text, 14, selected ? accent : ink, true);
         view.setGravity(Gravity.CENTER);
         view.setMinHeight(dp(48));
         view.setPadding(dp(12), dp(6), dp(12), dp(6));
-        view.setBackground(shape(selected ? deep : panel, selected ? mint : line, 12));
+        view.setBackground(shape(selected ? selectedFill : panel, selected ? accent : line, 12));
         view.setSelected(selected);
         view.setFocusable(true);
         view.setOnClickListener(ignored -> callback.run());
@@ -1649,6 +2184,223 @@ public final class MainActivity extends Activity {
     }
 
     private int dp(int value) { return Math.round(value * getResources().getDisplayMetrics().density); }
+
+    private final class WeatherIcon extends View {
+        private final Forecast.Weather weather;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path ice = new Path();
+
+        WeatherIcon(Forecast.Weather weather) {
+            super(MainActivity.this);
+            this.weather = weather;
+            setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+            paint.setStrokeCap(Paint.Cap.ROUND);
+            ice.moveTo(12, 4);
+            ice.lineTo(19, 11);
+            ice.lineTo(12, 21);
+            ice.lineTo(5, 11);
+            ice.close();
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            canvas.save();
+            float scale = Math.min(getWidth(), getHeight()) / 24f;
+            canvas.translate((getWidth() - 24 * scale) / 2f, (getHeight() - 24 * scale) / 2f);
+            canvas.scale(scale, scale);
+            switch (weather) {
+                case SUNNY -> sun(canvas, 12, 12, 5);
+                case PARTLY_SUNNY -> {
+                    sun(canvas, 9, 9, 4);
+                    cloud(canvas, 14, 16, .76f);
+                }
+                case PARTLY_CLOUDY -> {
+                    sun(canvas, 8, 8, 3.5f);
+                    cloud(canvas, 13, 15, 1);
+                }
+                case CLOUDY -> cloud(canvas, 12, 13, 1.05f);
+                case RAIN, MIXED, SNOW -> {
+                    cloud(canvas, 12, 10, 1);
+                    if (weather != Forecast.Weather.SNOW) rain(canvas, 8);
+                    if (weather == Forecast.Weather.RAIN) rain(canvas, 15);
+                    else flake(canvas, weather == Forecast.Weather.MIXED ? 16 : 12, 18.5f);
+                }
+                case ICE -> {
+                    paint.setColor(accent);
+                    paint.setStyle(Paint.Style.STROKE);
+                    paint.setStrokeWidth(1.7f);
+                    canvas.drawPath(ice, paint);
+                    canvas.drawLine(5, 11, 19, 11, paint);
+                    canvas.drawLine(12, 4, 12, 21, paint);
+                    paint.setStyle(Paint.Style.FILL);
+                }
+            }
+            canvas.restore();
+        }
+
+        private void sun(Canvas canvas, float x, float y, float radius) {
+            paint.setColor(lightMode ? 0xffa85a00 : 0xffffca67);
+            paint.setStrokeWidth(1.4f);
+            canvas.drawCircle(x, y, radius, paint);
+            for (int ray = 0; ray < 8; ray++) {
+                canvas.save();
+                canvas.rotate(45 * ray, x, y);
+                canvas.drawLine(x, y - radius - 1.8f, x, y - radius - 3.4f, paint);
+                canvas.restore();
+            }
+        }
+
+        private void cloud(Canvas canvas, float x, float y, float scale) {
+            paint.setColor(lightMode ? 0xff526e91 : 0xffd2e2f7);
+            canvas.save();
+            canvas.translate(x, y);
+            canvas.scale(scale, scale);
+            canvas.drawCircle(-5, 0, 4, paint);
+            canvas.drawCircle(-.6f, -2.4f, 5, paint);
+            canvas.drawCircle(5.2f, .3f, 3.8f, paint);
+            canvas.drawRoundRect(-8.8f, -.7f, 9, 4.1f, 2.3f, 2.3f, paint);
+            canvas.restore();
+        }
+
+        private void rain(Canvas canvas, float x) {
+            paint.setColor(lightMode ? 0xff115d96 : 0xff78c8fb);
+            paint.setStrokeWidth(1.9f);
+            canvas.drawLine(x + 1, 16.5f, x - .8f, 20.6f, paint);
+        }
+
+        private void flake(Canvas canvas, float x, float y) {
+            paint.setColor(accent);
+            paint.setStrokeWidth(1.4f);
+            for (int branch = 0; branch < 3; branch++) {
+                canvas.save();
+                canvas.rotate(60 * branch, x, y);
+                canvas.drawLine(x, y - 3.4f, x, y + 3.4f, paint);
+                canvas.restore();
+            }
+        }
+    }
+
+    private void addCumulativeSnowChart(LinearLayout card, List<SnowTimeline.CumulativePoint> points,
+                                        int axisStart, int axisEnd, Integer dividingHour) {
+        if (points.isEmpty()) return;
+        add(card, label("Cumulative snowfall (" + units.depthUnit() + ")", 17, ink, true), 12);
+        add(card, new CumulativeSnowChart(points, axisStart, axisEnd, dividingHour), 5, dp(170));
+        add(card, label("Blue line · Median   |   Shaded band · Low to high (10th–90th percentile)",
+                12, muted, false), 4);
+        if (dividingHour != null) {
+            add(card, label("Dashed line · " + eventTime(dividingHour) + " separates elapsed model guidance from the forecast remaining",
+                    12, muted, false), 4);
+        }
+    }
+
+    private final class CumulativeSnowChart extends View {
+        private final List<SnowTimeline.CumulativePoint> points;
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final int axisStart, axisEnd;
+        private final Integer dividingHour;
+        private final double tick;
+
+        CumulativeSnowChart(List<SnowTimeline.CumulativePoint> points, int axisStart, int axisEnd, Integer dividingHour) {
+            super(MainActivity.this);
+            this.points = points;
+            this.axisStart = axisStart;
+            this.axisEnd = axisEnd;
+            this.dividingHour = dividingHour;
+            SnowTimeline.CumulativePoint total = points.get(points.size() - 1);
+            double target = total.high() * (units.centimeters() ? 2.54 : 1) / 3;
+            double magnitude = Math.pow(10, Math.floor(Math.log10(Math.max(.1, target))));
+            tick = Math.max(.1, Math.ceil(target / magnitude) * magnitude);
+            setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
+            setContentDescription("Cumulative snowfall from " + eventTime(axisStart) + " to " + eventTime(axisEnd)
+                    + ". Final low, median and high: " + amount(total.low()) + ", " + amount(total.median()) + ", and "
+                    + amount(total.high()) + " " + units.depthUnit() + ".");
+        }
+
+        @Override protected void onDraw(Canvas canvas) {
+            float top = dp(10), bottom = getHeight() - dp(36), right = getWidth() - dp(3);
+            int decimals = tick < 1 ? 1 : 0;
+            paint.setTextSize(dp(11));
+            paint.setTextAlign(Paint.Align.LEFT);
+            float left = paint.measureText(axisNumber(3 * tick, decimals)) + dp(8);
+            if (left >= right || top >= bottom) return;
+
+            for (int mark = 0; mark <= 3; mark++) {
+                float y = bottom - (bottom - top) * mark / 3;
+                paint.setColor(line);
+                paint.setStrokeWidth(dp(1));
+                canvas.drawLine(left, y, right, y, paint);
+                paint.setColor(muted);
+                canvas.drawText(axisNumber(tick * mark, decimals), 0, y + dp(4), paint);
+            }
+
+            double maximum = tick * 3 / (units.centimeters() ? 2.54 : 1);
+            Path low = new Path(), median = new Path(), high = new Path(), band = new Path();
+            for (int i = 0; i < points.size(); i++) {
+                SnowTimeline.CumulativePoint point = points.get(i);
+                float x = axisX(point.hour(), left, right);
+                plot(low, i, x, chartY(point.low(), maximum, top, bottom));
+                plot(median, i, x, chartY(point.median(), maximum, top, bottom));
+                float y = chartY(point.high(), maximum, top, bottom);
+                plot(high, i, x, y);
+                plot(band, i, x, y);
+            }
+            for (int i = points.size() - 1; i >= 0; i--) {
+                SnowTimeline.CumulativePoint point = points.get(i);
+                band.lineTo(axisX(point.hour(), left, right), chartY(point.low(), maximum, top, bottom));
+            }
+            band.close();
+            paint.setColor(accent);
+            paint.setAlpha(55);
+            canvas.drawPath(band, paint);
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setColor(muted);
+            canvas.drawPath(low, paint);
+            canvas.drawPath(high, paint);
+            paint.setColor(accent);
+            paint.setStrokeWidth(dp(2));
+            canvas.drawPath(median, paint);
+            if (dividingHour != null) {
+                float x = axisX(dividingHour, left, right);
+                paint.setColor(warn);
+                paint.setStrokeWidth(dp(1));
+                paint.setPathEffect(new android.graphics.DashPathEffect(new float[]{dp(4), dp(4)}, 0));
+                canvas.drawLine(x, top, x, bottom, paint);
+                paint.setPathEffect(null);
+            }
+            paint.setStyle(Paint.Style.FILL);
+
+            paint.setColor(muted);
+            drawTime(canvas, axisStart, left, bottom, Paint.Align.LEFT);
+            drawTime(canvas, axisEnd, right, bottom, Paint.Align.RIGHT);
+            if (points.size() >= 5 && right - left >= dp(155)) {
+                int hour = points.get(points.size() / 2).hour();
+                drawTime(canvas, hour, axisX(hour, left, right), bottom, Paint.Align.CENTER);
+            }
+        }
+
+        private String axisNumber(double value, int decimals) {
+            return String.format(Locale.US, "%." + decimals + "f", value);
+        }
+
+        private float axisX(int hour, float left, float right) {
+            return left + (right - left) * (hour - axisStart) / (axisEnd - axisStart);
+        }
+
+        private float chartY(double value, double maximum, float top, float bottom) {
+            return bottom - (bottom - top) * (float)(value / maximum);
+        }
+
+        private void plot(Path path, int index, float x, float y) {
+            if (index == 0) path.moveTo(x, y);
+            else path.lineTo(x, y);
+        }
+
+        private void drawTime(Canvas canvas, int hour, float x, float bottom, Paint.Align align) {
+            var time = forecast.start.atStartOfDay().plusHours(hour);
+            paint.setTextAlign(align);
+            canvas.drawText(time.format(DATE), x, bottom + dp(15), paint);
+            canvas.drawText(time.format(HOUR), x, bottom + dp(29), paint);
+        }
+    }
 
     private final class HourChart extends View {
         private final double[][] values = new double[24][];
@@ -1682,7 +2434,7 @@ public final class MainActivity extends Activity {
                 float x = left + (hour + .5f) * step;
                 double[] metrics = values[hour];
                 if (metrics != null) {
-                    paint.setColor(mint);
+                    paint.setColor(accent);
                     float median = bottom - (float)(metrics[1] / max) * (bottom - top);
                     canvas.drawRect(x - step * .22f, median, x + step * .22f, bottom, paint);
                     paint.setColor(ink);
@@ -1715,7 +2467,7 @@ public final class MainActivity extends Activity {
             paint.setColor(line);
             canvas.drawRoundRect(0, 0, w, h, h / 2, h / 2, paint);
             if (probability > 0) {
-                paint.setColor(mint);
+                paint.setColor(accent);
                 canvas.drawRoundRect(0, 0, Math.min(w, Math.max(dp(2), (float)(w * probability))),
                         h, h / 2, h / 2, paint);
             }

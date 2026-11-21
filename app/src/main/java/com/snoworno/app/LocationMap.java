@@ -36,6 +36,7 @@ final class LocationMap extends View {
     private final ScaleGestureDetector pinch;
     private final Selection listener;
     private final float density;
+    private final int markerColor;
     private int zoom = 14;
     private double x, y;
     private float pinchFactor = 1;
@@ -45,6 +46,7 @@ final class LocationMap extends View {
         super(context);
         this.listener = listener;
         density = getResources().getDisplayMetrics().density;
+        markerColor = context.getColor(R.color.snow_accent_dark);
         x = (lon + 180) / 360;
         double sin = Math.sin(Math.toRadians(lat));
         y = .5 - Math.log((1 + sin) / (1 - sin)) / (4 * Math.PI);
@@ -124,7 +126,7 @@ final class LocationMap extends View {
     }
 
     @Override protected void onDraw(Canvas canvas) {
-        canvas.drawColor(0xff233642);
+        canvas.drawColor(0xff132747);
         int count = 1 << zoom;
         float tileSize = tileSize();
         double left = x * count - getWidth() / (2.0 * tileSize);
@@ -141,7 +143,7 @@ final class LocationMap extends View {
                 if (bitmap != null) {
                     canvas.drawBitmap(bitmap, null, new RectF(l, t, l + tileSize + .5f, t + tileSize + .5f), ink);
                 } else {
-                    ink.setColor(0xff345263);
+                    ink.setColor(0xff345681);
                     canvas.drawLine(l, t, l + tileSize, t, ink);
                     canvas.drawLine(l, t, l, t + tileSize, ink);
                     fetch(tile);
@@ -150,16 +152,16 @@ final class LocationMap extends View {
         }
         if (!visible.isEmpty() && visible.stream().allMatch(tile -> failed.get(tile) != null)) {
             ink.setTextSize(13 * density);
-            ink.setColor(0xffe0ebf1);
+            ink.setColor(0xfff3f8ff);
             ink.setTextAlign(Paint.Align.CENTER);
             canvas.drawText("Street tiles unavailable · Retry map", getWidth() / 2f, 26 * density, ink);
         }
         float cx = getWidth() / 2f, cy = getHeight() / 2f;
-        ink.setColor(0xff112330);
+        ink.setColor(0xff0a1730);
         canvas.drawCircle(cx, cy, 12 * density, ink);
-        ink.setColor(0xff78e4cf);
+        ink.setColor(markerColor);
         canvas.drawCircle(cx, cy, 8 * density, ink);
-        ink.setColor(0xff112330);
+        ink.setColor(0xff0a1730);
         canvas.drawCircle(cx, cy, 2.5f * density, ink);
     }
 
