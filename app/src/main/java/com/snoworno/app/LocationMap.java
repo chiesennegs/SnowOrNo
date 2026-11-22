@@ -14,7 +14,7 @@ import android.view.View;
 
 import java.io.File;
 import java.io.InputStream;
-import java.net.HttpURLConnection;
+import javax.net.ssl.HttpsURLConnection;
 import java.net.URL;
 import java.util.HashSet;
 import java.util.Set;
@@ -180,10 +180,11 @@ final class LocationMap extends View {
     }
 
     private static Bitmap load(Tile tile) {
-        HttpURLConnection connection = null;
+        HttpsURLConnection connection = null;
         try {
             String address = "https://tile.openstreetmap.org/" + tile.zoom() + "/" + tile.x() + "/" + tile.y() + ".png";
-            connection = (HttpURLConnection)new URL(address).openConnection();
+            connection = (HttpsURLConnection) new URL(address).openConnection();
+            connection.setInstanceFollowRedirects(false);
             connection.setRequestProperty("User-Agent", "SnowOrNo-Android/0.3");
             connection.setConnectTimeout(5500);
             connection.setReadTimeout(5500);

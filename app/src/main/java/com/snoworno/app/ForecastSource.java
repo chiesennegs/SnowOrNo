@@ -6,7 +6,7 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.HttpURLConnection;
+import javax.net.ssl.HttpsURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -95,9 +95,12 @@ final class ForecastSource {
     }
 
     static JSONObject read(String address) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(address).openConnection();
+        URL url = new URL(address);
+        if (!"https".equals(url.getProtocol())) throw new IOException("HTTPS is required.");
+        HttpsURLConnection connection = (HttpsURLConnection) url.openConnection();
         try {
             connection.setUseCaches(false);
+            connection.setInstanceFollowRedirects(false);
             connection.setConnectTimeout(10000);
             connection.setReadTimeout(12000);
             if (connection.getResponseCode() != 200) throw new IOException("Weather feed HTTP " + connection.getResponseCode());

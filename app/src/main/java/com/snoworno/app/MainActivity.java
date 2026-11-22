@@ -10,8 +10,6 @@ import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.location.Address;
-import android.location.Geocoder;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.SystemClock;
@@ -73,7 +71,10 @@ public final class MainActivity extends Activity {
     private static final DateTimeFormatter RETRIEVED = DateTimeFormatter.ofPattern("MMM d, h:mm a z", Locale.US);
     private static final long REFRESH_AFTER_MS = 15 * 60 * 1000L;
     private static final String COMPANY_SITE = "https://mooseaillc.com";
+    private static final String PRIVACY_POLICY_URL = COMPANY_SITE + "/privacy/snoworno";
     private static final String SUPPORT_EMAIL = "support@mooseaillc.com";
+    private static final String OPEN_METEO_URL = "https://open-meteo.com/";
+    private static final String WEATHER_DATA_LICENSE = "https://creativecommons.org/licenses/by/4.0/";
 
     private static final Forecast.Site[] SITES = {
             new Forecast.Site("Alta", "Wasatch Range, Utah", 40.58840, -111.63810, 8530),
@@ -310,6 +311,7 @@ public final class MainActivity extends Activity {
         if (historyTransfer) add(history, label("Transferring history…", 13, muted, false), 6);
         add(root, history, 12);
         add(root, action("About & support", false, this::showAbout), 12);
+        add(root, action("Privacy policy", false, () -> openLink(PRIVACY_POLICY_URL)), 6);
 
         root.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(1, 0, 1));
         LinearLayout logos = row();
@@ -611,6 +613,7 @@ public final class MainActivity extends Activity {
         LinearLayout source = column();
         add(source, label(sourceStatus, 12, showingCache ? warn : accent, true), 0);
         add(source, label("Retrieved " + RETRIEVED.format(retrievedAt.atZone(ZoneId.systemDefault())), 12, muted, false), 3);
+        add(source, openMeteoCredit("Weather data by Open-Meteo"), 3);
         if (tab == 1) {
             LinearLayout toolbar = row();
             toolbar.addView(source, new LinearLayout.LayoutParams(0, -2, 1));
@@ -882,6 +885,7 @@ public final class MainActivity extends Activity {
         add(root, heading, 0);
         add(root, label(site.name() + "  ·  " + String.format(Locale.US, "%,d ft", site.feet()),
                 15, muted, true), 8);
+        add(root, openMeteoCredit("Forecast data by Open-Meteo"), 3);
 
         StormFeedback.Review review = stormFeedback.review(site);
         LinearLayout tuning = card();
@@ -1041,6 +1045,7 @@ public final class MainActivity extends Activity {
         var amounts = entry.daily().amounts();
         LinearLayout summary = card();
         add(summary, label(site.name(), 18, ink, true), 0);
+        add(summary, openMeteoCredit("Forecast data by Open-Meteo"), 3);
         add(summary, label(feedbackWindow(entry.measurementWindow()), 14, muted, false), 4);
         add(summary, label("Set the cutoff to when you usually clear snow. Measure before clearing and enter the new snow for the period that ended. If you cleared more than once, add those measurements together.",
                 14, ink, false), 9);
@@ -1506,8 +1511,8 @@ public final class MainActivity extends Activity {
     }
 
     private void addHistoricalDay(LinearLayout card, HistoricalWeather.Day day) {
-        add(card, label(day.recent() ? "Recent model estimate · Open-Meteo" : "Historical reanalysis · Open-Meteo ERA5 Seamless",
-                12, accent, true), 6);
+        add(card, openMeteoCredit(day.recent() ? "Recent model estimate · Open-Meteo"
+                : "Historical reanalysis · Open-Meteo ERA5 Seamless"), 6);
         String weather = day.condition() == null ? "" : day.condition().label + "  ·  ";
         add(card, label(weather + "Low / high " + units.temperatures(day.lowF(), day.highF()), 14, ink, true), 6);
         String period = day.complete() ? "" : "Recorded hours · ";
@@ -1846,86 +1851,74 @@ public final class MainActivity extends Activity {
     }
 
     private void chooseLocation() {
-        String[] choices = new String[SITES.length + 3];
+        String[] choices = new String[SITES.length + 4];
         choices[0] = "Choose on map";
         choices[1] = "Search by address";
-        choices[2] = "Enter coordinates and elevation";
-        for (int i = 0; i < SITES.length; i++) choices[i + 3] = SITES[i].name() + "  ·  " + SITES[i].region();
+        choices[2] = "Search by city or ZIP";
+        choices[3] = "Enter coordinates and elevation";
+        for (int i = 0; i < SITES.length; i++) choices[i + 4] = SITES[i].name() + "  ·  " + SITES[i].region();
         dialogBuilder().setTitle("Forecast location")
                 .setItems(choices, (dialog, position) -> {
                     if (position == 0) showMap();
-                    else if (position == 1) searchAddress();
-                    else if (position == 2) editLocation(site.latitude(), site.longitude(), site.feet(), null);
-                    else selectSite(SITES[position - 3]);
+                    else if (position == 1) searchLocation(true);
+                    else if (position == 2) searchLocation(false);
+                    else if (position == 3) editLocation(site.latitude(), site.longitude(), site.feet(), null);
+                    else selectSite(SITES[position - 4]);
                 }).show();
     }
 
-    private void searchAddress() {
-        if (!Geocoder.isPresent()) {
-            dialogBuilder().setTitle("Address search unavailable")
-                    .setMessage("Choose a map pin or enter coordinates on this device.")
-                    .setPositiveButton("Open map", (dialog, which) -> showMap())
-                    .setNegativeButton("Cancel", null).show();
-            return;
-        }
+    private void searchLocation(boolean street) {
+        String title = street ? "Search by address" : "Search by city or ZIP";
         LinearLayout form = column();
         form.setPadding(dp(20), 0, dp(20), 4);
-        EditText address = input(form, "U.S. address or place", "", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_POSTAL_ADDRESS);
-        address.setHint("Street, city, state or ZIP");
-        AlertDialog dialog = dialogBuilder().setTitle("Search by address").setView(form)
+        EditText field = input(form, street ? "U.S. street address" : "U.S. city or ZIP", "",
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_POSTAL_ADDRESS);
+        field.setHint(street ? "Street, city, state and ZIP" : "City, state or ZIP code");
+        add(form, label(street ? "Sends your search to the U.S. Census Geocoder."
+                : "Sends your search to Open-Meteo.", 13, muted, false), 6);
+        AlertDialog dialog = dialogBuilder().setTitle(title).setView(form)
                 .setNegativeButton("Cancel", null).setPositiveButton("Search", null).create();
         dialog.setOnShowListener(ignored -> dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-            String query = address.getText().toString().trim();
+            String query = field.getText().toString().trim();
             if (query.isEmpty()) {
-                address.setError("Enter an address or place.");
+                field.setError(street ? "Enter a street address." : "Enter a city or ZIP code.");
                 return;
             }
             view.setEnabled(false);
-            Geocoder geocoder = new Geocoder(this, Locale.US);
-            java.util.function.Consumer<List<Address>> respond = matches -> runOnUiThread(() -> {
-                if (!dialog.isShowing() || isDestroyed()) return;
-                view.setEnabled(true);
-                List<Address> eligible = new ArrayList<>();
-                if (matches != null) {
-                    for (Address match : matches) {
-                        if (match.hasLatitude() && match.hasLongitude()
-                                && (match.getCountryCode() == null || match.getCountryCode().equalsIgnoreCase("US"))
-                                && ForecastSource.validSite(match.getLatitude(), match.getLongitude(), 0)) eligible.add(match);
-                    }
-                }
-                if (eligible.isEmpty()) {
-                    address.setError("No U.S. match found. Try adding a city or ZIP code.");
+            field.setError(null);
+            locationWorker.submit(() -> {
+                List<LocationSearch.Match> results;
+                try {
+                    results = street ? LocationSearch.findStreet(query) : LocationSearch.findPlace(query);
+                } catch (Exception error) {
+                    // Network exceptions can include the search URL and address.
+                    runOnUiThread(() -> {
+                        if (dialog.isShowing() && !isDestroyed()) {
+                            view.setEnabled(true);
+                            field.setError("Search is unavailable. Try again or choose a map pin.");
+                        }
+                    });
                     return;
                 }
-                dialog.dismiss();
-                String[] labels = eligible.stream().map(MainActivity::addressLabel).toArray(String[]::new);
-                dialogBuilder().setTitle("Choose an address").setItems(labels, (results, which) -> {
-                    Address selected = eligible.get(which);
-                    editLocation(selected.getLatitude(), selected.getLongitude(), null, labels[which]);
-                }).setNegativeButton("Cancel", null).show();
-            });
-            if (android.os.Build.VERSION.SDK_INT >= 33) {
-                geocoder.getFromLocationName(query, 5, new Geocoder.GeocodeListener() {
-                    @Override public void onGeocode(List<Address> matches) { respond.accept(matches); }
-                    @Override public void onError(String message) { respond.accept(null); }
-                });
-            } else {
-                locationWorker.submit(() -> {
-                    try {
-                        respond.accept(geocoder.getFromLocationName(query, 5));
-                    } catch (java.io.IOException error) {
-                        respond.accept(null);
+                runOnUiThread(() -> {
+                    if (!dialog.isShowing() || isDestroyed()) return;
+                    view.setEnabled(true);
+                    if (results.isEmpty()) {
+                        field.setError(street ? "No match. Try a full address or choose a map pin."
+                                : "No match. Try a city and state or a five-digit ZIP code.");
+                        return;
                     }
+                    dialog.dismiss();
+                    String[] labels = results.stream().map(LocationSearch.Match::label).toArray(String[]::new);
+                    dialogBuilder().setTitle(street ? "Choose an address" : "Choose a place")
+                            .setItems(labels, (picker, which) -> {
+                                LocationSearch.Match selected = results.get(which);
+                                editLocation(selected.latitude(), selected.longitude(), null, selected.label());
+                            }).setNegativeButton("Cancel", null).show();
                 });
-            }
+            });
         }));
         dialog.show();
-    }
-
-    private static String addressLabel(Address address) {
-        String full = address.getAddressLine(0);
-        return full == null || full.trim().isEmpty()
-                ? mapCoordinates(address.getLatitude(), address.getLongitude()) : full;
     }
 
     private void showMap() {
@@ -2026,9 +2019,17 @@ public final class MainActivity extends Activity {
         return field;
     }
 
+    private TextView openMeteoCredit(String text) {
+        TextView credit = label(text, 12, accent, false);
+        credit.setPaintFlags(credit.getPaintFlags() | Paint.UNDERLINE_TEXT_FLAG);
+        credit.setOnClickListener(view -> openLink(OPEN_METEO_URL));
+        return credit;
+    }
+
     private void showMethods() {
         dialogBuilder().setTitle("Forecast methods")
                 .setMessage("Live data: NOAA GEFS, ECMWF IFS, and Canada GEM (GEPS) via Open-Meteo."
+                        + "\n\nOpen-Meteo weather data are licensed under CC BY 4.0. SnowOrNo processes that data into forecast ranges, storm windows, and snow depth estimates."
                         + "\n\nThe last successful forecast for this location may be shown while refreshing or when a live update fails. Saved forecasts expire after 48 hours. Retrieval time is shown in your device's timezone."
                         + "\n\nThe point and elevation are inputs to model post-processing. Model grids cover a larger area."
                         + "\n\nSnowOrNo archives storm forecasts as they load. Measured snowfall can inform a labeled experimental median preview. Forward forecast ranges and model weights use the original ensemble. Per-model accuracy uses the first complete forecast retrieved up to seven days before each measured storm."
@@ -2040,6 +2041,7 @@ public final class MainActivity extends Activity {
                         + "\n\nFresh snow details use modeled temperature, rain and cloud cover to estimate melt and refreeze of fresh snow water on level, open terrain.")
                 .setNeutralButton("Utah Snow Ensemble", (dialog, which) ->
                         openLink("https://weather.utah.edu/index.php?d=240HS&r=NU&t=ensgefsds"))
+                .setNegativeButton("CC BY 4.0", (dialog, which) -> openLink(WEATHER_DATA_LICENSE))
                 .setPositiveButton("Done", null).show();
     }
 
