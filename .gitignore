@@ -4,3 +4,7 @@ local.properties
 build/
 *.iml
 *.jks
+
+# Android release signing
+*.keystore
+keystore.properties
