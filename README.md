@@ -6,7 +6,9 @@ Created by [MooseAI, LLC](https://mooseaillc.com) · Support: [support@mooseaill
 
 ## Build and release
 
-Install JDK 25, Android SDK Platform 36, and Build Tools 36.0.0. Set `JAVA_HOME` to JDK 25 and `ANDROID_HOME` to the Android SDK directory. In Android Studio, open the repository and select JDK 25 and the Gradle Wrapper in Gradle settings. The app uses AGP 9.5.2 and the wrapper pins Gradle 9.9.2. Java source and bytecode remain at 17, and the app runs on Android 8.0 and later.
+Install JDK 25, Android SDK Platform 36, and Build Tools 36.0.0. Set `JAVA_HOME` to JDK 25 and `ANDROID_HOME` to the Android SDK directory. The app uses AGP 9.5.2 and the wrapper pins Gradle 9.9.2. Java source and bytecode remain at 17, and the app runs on Android 8.0 and later.
+
+For IDE sync, use Android Studio Rabbit 2 (2026.2.2) or a later version that supports AGP 9.5. Select JDK 25 and the Gradle Wrapper in Gradle settings. The wrapper also builds from the terminal using JDK 25.
 
 ```sh
 ./gradlew --version
