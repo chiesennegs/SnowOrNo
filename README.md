@@ -4,10 +4,27 @@ Native Android prototype for location-specific snow accumulation, elevation-spec
 
 Created by [MooseAI, LLC](https://mooseaillc.com) · Support: [support@mooseaillc.com](mailto:support@mooseaillc.com)
 
+## Build and release
+
+Install JDK 25, Android SDK Platform 36, and Build Tools 36.0.0. Set `JAVA_HOME` to JDK 25 and `ANDROID_HOME` to the Android SDK directory. In Android Studio, open the repository and select JDK 25 and the Gradle Wrapper in Gradle settings. The app uses AGP 9.5.2 and the wrapper pins Gradle 9.9.2. Java source and bytecode remain at 17, and the app runs on Android 8.0 and later.
+
+```sh
+./gradlew --version
+./gradlew assembleDebug
+```
+
+Run the app from Android Studio on an emulator or device, or install the APK at `app/build/outputs/apk/debug/app-debug.apk`. Debug builds use Android's debug key and can run without the release credentials.
+
+For a release, place the existing upload keystore and a local `keystore.properties` in the repository root. Set `storeFile=snoworno-upload.jks` and `keyAlias=snoworno-upload`, and supply `storePassword` and `keyPassword` from secure storage. Both files are Git-ignored.
+
+```sh
+./gradlew clean bundleRelease
+```
+
+The signed bundle is written to `app/build/outputs/bundle/release/app-release.aab`. Use the [MooseAI Android release procedure](docs/android-release.md) to verify it before submitting to Play Console.
+
 ## Run
 
-- Open this directory in Android Studio. Set the Gradle JDK to 17 or 21 and select a local Gradle 8.13 distribution in the Gradle settings. Install Android SDK 35 if prompted. The app runs on Android 8.0 or later.
-- Run the app from Android Studio on an emulator or a connected Android device. To build an installable debug APK, run `gradle assembleDebug` with the same JDK and Gradle versions. The APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
 - On first launch, the app requests a live forecast for Salt Lake City. It refreshes for the selected location on launch, on location changes, when returning to the app after 15 minutes, and when you tap the **Refresh** icon. Use **Change → Choose on map** to place a pin and review the coordinates and terrain elevation, or choose **Search by address**, enter coordinates manually, or select a preset. The location name and surface settings are stored on the device. Coordinates and elevation are submitted to the forecast provider.
 - The forecast cache holds the most recent successful responses for up to 12 coordinate-and-elevation combinations. Each entry lasts up to 48 hours. The app can show cached guidance during a refresh or after an outage, with its retrieval time and a cache status label. The forecast calendar advances to the current local date when reading saved data. Expired or unreadable entries are skipped.
 - Tap **Save favorite** to keep the current location. Tap **Favorites** to switch among saved locations or use **Manage** to rename or remove one. Favorites persist on the device independently of the forecast cache.

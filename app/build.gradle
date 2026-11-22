@@ -6,44 +6,72 @@ plugins {
 
 def keystoreProperties = new Properties()
 def keystorePropertiesFile = rootProject.file('keystore.properties')
+def requiredSigningProperties = ['storeFile', 'storePassword', 'keyAlias', 'keyPassword']
 
-if (keystorePropertiesFile.exists()) {
-    keystoreProperties.load(
-        new FileInputStream(keystorePropertiesFile)
-    )
+if (keystorePropertiesFile.isFile()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
+def missingSigningProperties = requiredSigningProperties.findAll {
+    keystoreProperties.getProperty(it)?.isBlank() != false
+}
+def releaseKeystore = missingSigningProperties.isEmpty()
+    ? rootProject.file(keystoreProperties.getProperty('storeFile'))
+    : null
+
+def verifyReleaseSigning = tasks.register('verifyReleaseSigning') {
+    doLast {
+        if (!missingSigningProperties.isEmpty()) {
+            throw new GradleException(
+                "Add the missing release signing properties to keystore.properties: ${missingSigningProperties.join(', ')}."
+            )
+        }
+        if (!releaseKeystore.isFile() || !releaseKeystore.canRead()) {
+            throw new GradleException('The upload keystore configured in keystore.properties is missing or unreadable.')
+        }
+    }
+}
+
+tasks.configureEach {
+    if (name in ['packageRelease', 'packageReleaseBundle', 'signReleaseBundle', 'validateSigningRelease']) {
+        dependsOn(verifyReleaseSigning)
+    }
 }
 
 android {
-    namespace 'com.snoworno.app'
-    compileSdk 35
+    namespace = 'com.snoworno.app'
+    enableKotlin = false
+    compileSdk {
+        version = release(36)
+    }
 
     defaultConfig {
-        applicationId 'com.mooseaillc.snoworno'
-        minSdk 26
-        targetSdk 35
-        versionCode 24
-        versionName '0.9.13'
+        applicationId = 'com.mooseaillc.snoworno'
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 24
+        versionName = '0.9.13'
     }
 
     signingConfigs {
-        release {
-            storeFile rootProject.file(
-                keystoreProperties['storeFile']
-            )
-            storePassword keystoreProperties['storePassword']
-            keyAlias keystoreProperties['keyAlias']
-            keyPassword keystoreProperties['keyPassword']
+        if (releaseKeystore != null) {
+            release {
+                storeFile = releaseKeystore
+                storePassword = keystoreProperties.getProperty('storePassword')
+                keyAlias = keystoreProperties.getProperty('keyAlias')
+                keyPassword = keystoreProperties.getProperty('keyPassword')
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig signingConfigs.release
+            signingConfig = signingConfigs.findByName('release')
         }
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_17
-        targetCompatibility JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 }

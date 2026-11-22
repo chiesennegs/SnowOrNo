@@ -3,8 +3,10 @@
 local.properties
 build/
 *.iml
-*.jks
 
 # Android release signing
+*.jks
 *.keystore
+*.p12
+*.pfx
 keystore.properties
